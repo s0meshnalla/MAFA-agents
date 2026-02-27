@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -25,11 +26,14 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from vectordbsupabase import SupabaseVectorDB
 from tools.memory_tools import store_user_context, retrieve_user_context
 from event_bus import MCPEventBus, MCPEvent, MCPTopics, get_event_bus
+from http_client import get
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+BROKER_API_URL = os.getenv("BROKER_API_URL", "http://localhost:8080")
 
 # ---------------------------------------------------------------------------
 # MCP Server Configurations
@@ -190,6 +194,8 @@ class TrueMCPOrchestrator:
         self.vector_db = SupabaseVectorDB()
         self.event_bus = get_event_bus()
         self.mcp_manager = MCPClientManager()
+        self._company_cache: List[Dict[str, Any]] = []
+        self._company_cache_ts: float = 0.0
         
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
@@ -249,6 +255,31 @@ class TrueMCPOrchestrator:
         )
         
         try:
+            # 0. Ensure referenced company is supported by broker
+            company_block = await self._check_company_support(query)
+            if company_block:
+                from agents.general_agent import run_general_agent_no_broker
+                general_response = run_general_agent_no_broker(query, user_id)
+                combined = general_response or company_block
+                await self.event_bus.publish_raw(
+                    MCPTopics.MCP_RESULTS,
+                    user_id,
+                    {
+                        "query": query,
+                        "response": combined,
+                        "servers_used": [],
+                        "session_id": session_id,
+                    },
+                )
+                return {
+                    "response": combined,
+                    "mcp_servers_used": [],
+                    "success": True,
+                    "execution_time": time.time() - start_time,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                }
+
             # 1. Load conversation context
             context = await self._load_context(user_id, query)
             
@@ -322,6 +353,90 @@ class TrueMCPOrchestrator:
         except Exception as exc:
             logger.warning(f"Failed to load context: {exc}")
             return ""
+
+    async def _check_company_support(self, query: str) -> Optional[str]:
+        """Return a user-facing message if the company isn't supported by the broker."""
+        query_text = (query or "").strip()
+        if not query_text:
+            return None
+
+        companies = self._fetch_supported_companies()
+        if not companies:
+            return None
+
+        symbols: List[str] = []
+        names: List[str] = []
+        for company in companies:
+            symbol = str(company.get("symbol", "")).upper().strip()
+            name = str(company.get("name", "")).strip()
+            if symbol:
+                symbols.append(symbol)
+            if name:
+                names.append(name)
+
+        if not symbols:
+            return None
+
+        query_lower = query_text.lower()
+        symbol_set = set(symbols)
+        for symbol in symbol_set:
+            if re.search(rf"\b{re.escape(symbol.lower())}\b", query_lower):
+                return None
+
+        for name in names:
+            if name.lower() in query_lower:
+                return None
+
+        if not self._query_mentions_company(query_text):
+            return None
+
+        return (
+            "Thanks for asking. That company is not supported by our broker yet, "
+            "but it might be in the future. Please keep an eye out for updates."
+        )
+
+    def _query_mentions_company(self, query: str) -> bool:
+        """Heuristic to detect whether a query is about a specific company/ticker."""
+        q = query.lower()
+        keywords = [
+            "stock",
+            "shares",
+            "price",
+            "buy",
+            "sell",
+            "trade",
+            "ticker",
+            "symbol",
+            "company",
+            "invest",
+        ]
+        if any(word in q for word in keywords):
+            return True
+
+        for token in re.findall(r"\b[A-Z]{1,5}\b", query):
+            if token.isalpha():
+                return True
+        return False
+
+    def _fetch_supported_companies(self) -> List[Dict[str, Any]]:
+        """Fetch broker-supported companies with a short TTL cache."""
+        now = time.time()
+        if self._company_cache and (now - self._company_cache_ts) < 300:
+            return self._company_cache
+
+        try:
+            response = get(f"{BROKER_API_URL}/companies", timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data", payload)
+            if isinstance(data, list):
+                self._company_cache = data
+                self._company_cache_ts = now
+                return data
+        except Exception as exc:
+            logger.warning(f"Company catalog lookup failed: {exc}")
+
+        return []
     
     async def _run_agent(
         self,

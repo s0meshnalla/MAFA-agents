@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
+import math
+import hashlib
+import logging
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -8,10 +12,12 @@ from supabase import Client, create_client
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_TABLE = os.getenv("SUPABASE_VECTOR_TABLE", "agent_memory")
 DEFAULT_RPC_FN = os.getenv("SUPABASE_VECTOR_MATCH_FN", "match_agent_context")
 DEFAULT_EMBED_DIM = int(os.getenv("SUPABASE_VECTOR_DIM", "768"))
-DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "models/embedding-001")
+DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "models/text-embedding-004")
 
 
 def build_schema_sql(
@@ -111,13 +117,59 @@ class SupabaseVectorDB:
         return cls._genai_module
 
     def embed_text(self, text: str, model: Optional[str] = None) -> List[float]:
-        genai = self._init_genai()
-        model_name = model or DEFAULT_EMBED_MODEL
-        response = genai.embed_content(model=model_name, content=text)
-        embedding = response.get("embedding") if isinstance(response, dict) else None
-        if not embedding:
-            raise RuntimeError("Embedding service returned no vector.")
-        return self._validate_embedding(embedding)
+        model_candidates: List[str] = []
+        requested_model = model or DEFAULT_EMBED_MODEL
+        for candidate in (requested_model, "models/text-embedding-004", "models/embedding-001"):
+            if candidate and candidate not in model_candidates:
+                model_candidates.append(candidate)
+
+        remote_errors: List[str] = []
+        try:
+            genai = self._init_genai()
+            for candidate in model_candidates:
+                try:
+                    response = genai.embed_content(model=candidate, content=text)
+                    embedding = self._extract_embedding(response)
+                    if embedding:
+                        return self._validate_embedding(embedding)
+                    remote_errors.append(f"{candidate}: empty embedding")
+                except Exception as exc:
+                    remote_errors.append(f"{candidate}: {exc}")
+        except Exception as exc:
+            remote_errors.append(f"genai init failed: {exc}")
+
+        logger.warning(
+            "Falling back to local deterministic embeddings; remote embedding failed (%s)",
+            " | ".join(remote_errors)[:1500],
+        )
+        return self._local_embedding(text)
+
+    def _extract_embedding(self, response: Any) -> Optional[List[float]]:
+        if isinstance(response, dict):
+            embedding = response.get("embedding")
+            if isinstance(embedding, list):
+                return embedding
+        embedding_attr = getattr(response, "embedding", None)
+        if isinstance(embedding_attr, list):
+            return embedding_attr
+        return None
+
+    def _local_embedding(self, text: str) -> List[float]:
+        tokens = re.findall(r"[a-z0-9_]+", text.lower())
+        if not tokens:
+            return [0.0] * self.embedding_dim
+
+        vector = [0.0] * self.embedding_dim
+        for token in tokens:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:4], "big") % self.embedding_dim
+            sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+            vector[index] += sign
+
+        norm = math.sqrt(sum(v * v for v in vector))
+        if norm > 0:
+            vector = [v / norm for v in vector]
+        return vector
 
     def upsert_record(
         self,

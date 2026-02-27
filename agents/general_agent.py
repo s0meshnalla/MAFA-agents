@@ -93,6 +93,27 @@ Operating rules
 
 agent = create_react_agent(model=model, tools=tools, prompt=BASE_SYSTEM_PROMPT)
 
+# Limited agent: no broker API tools, for unsupported-company queries
+NO_BROKER_TOOLS = [
+    google_search,
+    search_user_memory,
+    store_user_note,
+]
+
+NO_BROKER_PROMPT = BASE_SYSTEM_PROMPT + """
+
+Broker limits
+- You must NOT call broker API tools in this mode. Use only google_search or memory tools.
+- Start by politely noting the company is not supported by the broker yet, and that it might be supported in the future.
+- Then answer any general, non-broker questions the user asked (company overview, public info, news).
+"""
+
+agent_no_broker = create_react_agent(model=model, tools=NO_BROKER_TOOLS, prompt=NO_BROKER_PROMPT)
+
 
 def run_general_agent(user_message: str, user_id: int) -> str:
     return run_agent_turn("general_agent", agent, user_message, user_id)
+
+
+def run_general_agent_no_broker(user_message: str, user_id: int) -> str:
+    return run_agent_turn("general_agent", agent_no_broker, user_message, user_id)
