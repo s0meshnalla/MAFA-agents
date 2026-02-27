@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, asdict
 from typing import Any, Callable, Dict, List, Optional
@@ -333,7 +334,9 @@ def get_event_bus() -> MCPEventBus:
     """Get the global event bus instance."""
     global _event_bus
     if _event_bus is None:
-        _event_bus = MCPEventBus()
+        # Prefer REDIS_URL from environment (used by health checks and config)
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        _event_bus = MCPEventBus(redis_url=redis_url)
     return _event_bus
 
 

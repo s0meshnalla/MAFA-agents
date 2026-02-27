@@ -292,7 +292,7 @@ async def check_broker_api(url: str) -> Dict[str, Any]:
     try:
         import httpx
         async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{url}/health")
+            response = await client.get(f"{url}/actuator/health")
             if response.status_code == 200:
                 return {"status": "healthy", "url": url}
             return {"status": "unhealthy", "status_code": response.status_code}
