@@ -277,22 +277,23 @@ async def check_redis(redis_url: str = "redis://localhost:6379") -> Dict[str, An
 
 
 async def check_supabase(url: str, key: str) -> Dict[str, Any]:
-    """Check Supabase connectivity."""
+    """Check Supabase connectivity with a real query."""
     try:
         from supabase import create_client
         client = create_client(url, key)
-        # Simple health check - just verify client creation
+        # Do a real lightweight query — fetch 0 rows from the memory table
+        result = client.table("agent_memory").select("id").limit(1).execute()
         return {"status": "healthy", "url": url}
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
 
 
 async def check_broker_api(url: str) -> Dict[str, Any]:
-    """Check broker API connectivity."""
+    """Check broker API connectivity (Spring Boot uses /actuator/health)."""
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{url}/health")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{url}/actuator/health")
             if response.status_code == 200:
                 return {"status": "healthy", "url": url}
             return {"status": "unhealthy", "status_code": response.status_code}
@@ -301,10 +302,16 @@ async def check_broker_api(url: str) -> Dict[str, Any]:
 
 
 def check_mcp_servers() -> Dict[str, Any]:
-    """Check MCP server availability."""
+    """Check MCP server availability.
+
+    MCP servers are invoked per-request via agent functions (not persistent
+    connections), so we report the configured list rather than claiming
+    live connectivity.
+    """
     servers = ["market", "execution", "portfolio", "strategy"]
     return {
         "status": "healthy",
         "servers": servers,
         "count": len(servers),
+        "note": "MCP tools are invoked via agent functions, not persistent connections",
     }
