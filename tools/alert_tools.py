@@ -19,43 +19,14 @@ AlertResponseDto:
 
 import json
 import logging
-import os
 from typing import Any, Dict, Optional
 
 from langchain_core.tools import tool
 from requests import RequestException
 
-from http_client import get, post, delete
+from tools._http_helpers import fetch_json as _fetch_json, post_json as _post_json, delete_json as _delete_json, unwrap as _unwrap, API_BASE, make_error_response as _err
 
 logger = logging.getLogger(__name__)
-
-API_BASE = os.getenv("BROKER_API_URL", "http://localhost:8080")
-
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-def _fetch_json(url: str, timeout: int = 10) -> Any:
-    response = get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _post_json(url: str, body: Dict[str, Any], timeout: int = 15) -> Any:
-    response = post(url, json=body, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _delete_json(url: str, timeout: int = 10) -> Any:
-    response = delete(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _unwrap(payload: Any) -> Any:
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    return payload
 
 
 # ── tools ───────────────────────────────────────────────────────────────────
@@ -97,7 +68,7 @@ def create_alert(symbol: str, condition: str, target_price: float, channel: str 
         return json.dumps(data, default=str) if data else json.dumps({"error": "Alert creation failed"})
     except RequestException as exc:
         logger.warning(f"Error creating alert for {symbol}: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, f"create alert for {symbol}"))
 
 
 @tool
@@ -120,7 +91,7 @@ def get_alerts(status: Optional[str] = None) -> str:
         return json.dumps(data, default=str) if isinstance(data, list) else json.dumps([])
     except (RequestException, ValueError, TypeError) as exc:
         logger.warning(f"Error fetching alerts: {exc}")
-        return json.dumps([])
+        return json.dumps(_err(exc, "get alerts"))
 
 
 @tool
@@ -139,4 +110,4 @@ def delete_alert(alert_id: int) -> str:
         if hasattr(exc, 'response') and exc.response is not None and exc.response.status_code == 404:
             return json.dumps({"error": f"Alert {alert_id} not found"})
         logger.warning(f"Error deleting alert {alert_id}: {exc}")
-        return json.dumps({"error": str(exc)})
+        return json.dumps(_err(exc, f"delete alert {alert_id}"))
