@@ -7,6 +7,7 @@ Features: Rate limiting, input validation, structured logging, health checks.
 import asyncio
 import logging
 import os
+import uuid
 import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -252,9 +253,9 @@ async def health_check():
         "mcp_servers": mcp_status,
     }
     
-    # Determine overall status
+    # Determine overall status — 'unavailable' means a dependency is down (degraded, not healthy)
     critical_healthy = all(
-        checks[k].get("status") in ("healthy", "unavailable") 
+        checks[k].get("status") == "healthy"
         for k in ["redis", "supabase", "mcp_servers"]
     )
     
@@ -357,85 +358,51 @@ async def websocket_stream(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Agent Endpoints
+# Agent Endpoints (DRY helper eliminates repeated boilerplate)
 # ---------------------------------------------------------------------------
 
-@app.post("/execute-agent")
-def execute_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the agent and returns its reply."""
+def _run_agent_endpoint(agent_fn, agent_label: str, payload: ExecuteAgentRequest, token: str):
+	"""Shared logic for all agent endpoints — eliminates 5x code duplication."""
 	set_request_token(token)
 	init_request_cache()
+	session_id = payload.sessionId or str(uuid.uuid4())
 	try:
-		result = run_execute_agent(user_message=payload.query, user_id=payload.userId)
-		return {"data": result, "userId": payload.userId}
+		result = agent_fn(user_message=payload.query, user_id=payload.userId, session_id=session_id)
+		return {"data": result, "userId": payload.userId, "sessionId": session_id}
 	except Exception as exc:
-		logger.error(f"Error executing agent: {exc}")
-		raise HTTPException(status_code=500, detail="Failed to execute agent") from exc
+		logger.error(f"Error executing {agent_label}: {exc}")
+		raise HTTPException(status_code=500, detail=f"Failed to execute {agent_label}") from exc
 	finally:
 		clear_request_cache()
 		set_request_token(None)
+
+
+@app.post("/execute-agent")
+def execute_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint that runs the execution agent and returns its reply."""
+	return _run_agent_endpoint(run_execute_agent, "execution agent", payload, token)
 
 
 @app.post("/investment-strategy-agent")
 def investment_strategy_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
 	"""HTTP endpoint that runs the investment strategy agent."""
-	set_request_token(token)
-	init_request_cache()
-	try:
-		result = run_investment_strategy_agent(user_message=payload.query, user_id=payload.userId)
-		return {"data": result, "userId": payload.userId}
-	except Exception as exc:
-		logger.error(f"Error executing strategy agent: {exc}")
-		raise HTTPException(status_code=500, detail="Failed to execute strategy agent") from exc
-	finally:
-		clear_request_cache()
-		set_request_token(None)
+	return _run_agent_endpoint(run_investment_strategy_agent, "strategy agent", payload, token)
 
 @app.post("/market-research-agent")
 def market_research_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the agent and returns its reply."""
-	set_request_token(token)
-	init_request_cache()
-	try:
-		result = run_market_research_agent(user_message=payload.query, user_id=payload.userId)
-		return {"data": result, "userId": payload.userId}
-	except Exception as exc:
-		logger.error(f"Error executing agent: {exc}")
-		raise HTTPException(status_code=500, detail="Failed to execute agent") from exc
-	finally:
-		clear_request_cache()
-		set_request_token(None)
+	"""HTTP endpoint that runs the market research agent and returns its reply."""
+	return _run_agent_endpoint(run_market_research_agent, "market research agent", payload, token)
 
 
 @app.post("/general-agent")
 def general_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
 	"""HTTP endpoint that runs the general agent and returns its reply."""
-	set_request_token(token)
-	init_request_cache()
-	try:
-		result = run_general_agent(user_message=payload.query, user_id=payload.userId)
-		return {"data": result, "userId": payload.userId}
-	except Exception as exc:
-		logger.error(f"Error executing agent: {exc}")
-		raise HTTPException(status_code=500, detail="Failed to execute agent") from exc
-	finally:
-		clear_request_cache()
-		set_request_token(None)
+	return _run_agent_endpoint(run_general_agent, "general agent", payload, token)
   
 @app.post("/portfolio-manager-agent")
 def portfolio_manager_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
 	"""HTTP endpoint that runs the portfolio manager agent and returns its reply."""
-	set_request_token(token)
-	init_request_cache()
-	try:
-		result = run_portfolio_manager_agent(user_message=payload.query, user_id=payload.userId)
-		return {"data": result, "userId": payload.userId}
-	except Exception as exc:
-		logger.error(f"Error executing agent: {exc}")
-		raise HTTPException(status_code=500, detail="Failed to execute agent") from exc
-	finally:
-		clear_request_cache()
-		set_request_token(None)
+	return _run_agent_endpoint(run_portfolio_manager_agent, "portfolio manager agent", payload, token)
 
 
 @app.post("/mcp/query")
@@ -445,21 +412,18 @@ async def mcp_query_endpoint(payload: MCPQueryRequest, token: str = Depends(get_
 	set_request_token(token)
 	init_request_cache()
 	try:
+		session_id = payload.sessionId or str(uuid.uuid4())
 		# Use TRUE MCP Orchestrator
 		result = await mcp_orchestrator.orchestrate(
 			user_id=payload.userId,
 			query=payload.query,
-			session_id=payload.sessionId,
+			session_id=session_id,
 		)
 		return result
 	except Exception as exc:
 		logger.error(f"MCP orchestration error: {exc}")
-		# Return safe error response (don't leak internals)
-		return {
-			"error": "Internal server error",
-			"message": "Failed to process your request. Please try again later.",
-			"success": False,
-		}
+		# Return proper HTTP error instead of 200 with error body
+		raise HTTPException(status_code=500, detail="Failed to process your request. Please try again later.") from exc
 	finally:
 		clear_request_cache()
 		set_request_token(None)
@@ -472,6 +436,7 @@ async def mcp_query_endpoint(payload: MCPQueryRequest, token: str = Depends(get_
 @app.post("/mcp/market/predict")
 async def mcp_market_predict(symbol: str, token: str = Depends(get_token)):
 	"""Direct call to market research MCP server for prediction."""
+	import json as _json
 	from tools.market_research_tools import predict
 	try:
 		# Use .invoke() for LangChain StructuredTool objects
@@ -480,9 +445,12 @@ async def mcp_market_predict(symbol: str, token: str = Depends(get_token)):
 		elif hasattr(predict, 'run'):
 			result = predict.run(symbol.upper())
 		else:
-			# Direct function call as fallback
-			result = predict.func(symbol.upper()) if hasattr(predict, 'func') else 0.0
-		return {"symbol": symbol.upper(), "predicted_close": float(result), "success": True}
+			result = predict.func(symbol.upper()) if hasattr(predict, 'func') else '{"error": "no predict function"}'
+		# predict tool returns a JSON string like '{"ticker":"AAPL","predicted_close":255.73}'
+		parsed = _json.loads(result) if isinstance(result, str) else result
+		if "error" in parsed:
+			return {"symbol": symbol.upper(), "error": parsed["error"], "success": False}
+		return {"symbol": symbol.upper(), "predicted_close": float(parsed["predicted_close"]), "success": True}
 	except Exception as exc:
 		logger.warning(f"Market predict error for {symbol}: {exc}")
 		return {"symbol": symbol.upper(), "error": str(exc), "success": False}
@@ -499,15 +467,21 @@ async def mcp_execution_validate(
 	set_request_token(token)
 	init_request_cache()
 	
+	import json as _json
 	from tools.profile_tools import get_user_balance, get_user_holdings, get_current_stock_price
 	try:
-		# Use .invoke() for LangChain StructuredTool objects
-		balance = get_user_balance.invoke({}) if hasattr(get_user_balance, 'invoke') else get_user_balance.func()
+		# Tools return JSON strings — parse them into native Python values
+		balance_raw = get_user_balance.invoke({}) if hasattr(get_user_balance, 'invoke') else get_user_balance.func()
 		holdings_raw = get_user_holdings.invoke({}) if hasattr(get_user_holdings, 'invoke') else get_user_holdings.func()
-		price = get_current_stock_price.invoke({"symbol": symbol.upper()}) if hasattr(get_current_stock_price, 'invoke') else get_current_stock_price.func(symbol.upper())
+		price_raw = get_current_stock_price.invoke({"symbol": symbol.upper()}) if hasattr(get_current_stock_price, 'invoke') else get_current_stock_price.func(symbol.upper())
 		
-		# holdings_raw is a JSON string of List<Share>, each: {symbol, quantity, price, id}
-		import json as _json
+		# Parse JSON strings: {"balance": 172412.70}, {"symbol":"AAPL","price":264.72}
+		balance_data = _json.loads(balance_raw) if isinstance(balance_raw, str) else balance_raw
+		balance = float(balance_data.get("balance", 0)) if isinstance(balance_data, dict) else float(balance_data)
+		
+		price_data = _json.loads(price_raw) if isinstance(price_raw, str) else price_raw
+		price = float(price_data.get("price", 0)) if isinstance(price_data, dict) else float(price_data)
+		
 		try:
 			holdings_list = _json.loads(holdings_raw) if isinstance(holdings_raw, str) else holdings_raw
 		except (ValueError, TypeError):
