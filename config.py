@@ -71,43 +71,21 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
-    """Get validated settings instance."""
+    """Get validated settings instance (cached after first call)."""
+    global _settings
+    if _settings is not None:
+        return _settings
     try:
-        return Settings()
+        _settings = Settings()
+        return _settings
     except Exception as e:
         logger.error(f"Configuration error: {e}")
         logger.error("Please check your .env file and ensure all required variables are set.")
         sys.exit(1)
 
 
-# Mock prices for development/testing when broker API is unavailable
-MOCK_PRICES = {
-    "AAPL": 195.50,
-    "TSLA": 238.75,
-    "GOOGL": 142.30,
-    "MSFT": 415.20,
-    "AMZN": 178.90,
-    "NVDA": 722.48,
-    "META": 485.60,
-    "JPM": 198.45,
-    "IBM": 167.80,
-    "ORCL": 125.30,
-    "ADBE": 545.20,
-}
+_settings: Optional[Settings] = None
 
-MOCK_HOLDINGS = {
-    "AAPL": 10,
-    "TSLA": 5,
-    "GOOGL": 8,
-    "MSFT": 15,
-}
-
-MOCK_BALANCE = 50000.0
-
-
-# Load settings on import (fail-fast)
-try:
-    settings = get_settings()
-except SystemExit:
-    # Allow import to succeed for testing, but settings will be None
-    settings = None  # type: ignore
+# Load settings eagerly on import (fail-fast).
+# If validation fails the process exits; settings is never None at runtime.
+settings: Settings = get_settings()
