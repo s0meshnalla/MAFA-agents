@@ -1,23 +1,69 @@
 from __future__ import annotations
 
 import os
-import re
-import math
-import hashlib
+import socket
 import logging
 from typing import Any, Dict, List, Optional
 
+import httpx
 from dotenv import load_dotenv
 from supabase import Client, create_client
+from supabase.lib.client_options import SyncClientOptions
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# ISP DNS-hijack bypass: Excitel (and similar ISPs) resolve *.supabase.co to
+# a blocking proxy.  We resolve via Google DoH and patch socket.getaddrinfo
+# so every library (httpx, supabase-py, etc.) connects to the real IP.
+# ---------------------------------------------------------------------------
+_SUPABASE_HOST = os.getenv("SUPABASE_URL", "").replace("https://", "").replace("http://", "").strip("/")
+_DNS_OVERRIDE: dict[str, str] = {}  # hostname -> real IP
+
+def _resolve_via_doh(hostname: str) -> str | None:
+    """Resolve *hostname* using Google DNS-over-HTTPS (bypasses ISP DNS)."""
+    try:
+        import urllib.request, json
+        url = f"https://8.8.8.8/resolve?name={hostname}&type=A"
+        req = urllib.request.Request(url, headers={"Accept": "application/dns-json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            for ans in data.get("Answer", []):
+                if ans.get("type") == 1:  # A record
+                    return ans["data"]
+    except Exception as exc:
+        logger.debug("DoH resolution failed for %s: %s", hostname, exc)
+    return None
+
+def _bootstrap_dns_override():
+    """Resolve the Supabase host once at import time and patch getaddrinfo."""
+    if not _SUPABASE_HOST:
+        return
+    real_ip = _resolve_via_doh(_SUPABASE_HOST)
+    if not real_ip:
+        logger.warning("Could not resolve %s via DoH; Supabase may be unreachable", _SUPABASE_HOST)
+        return
+    _DNS_OVERRIDE[_SUPABASE_HOST] = real_ip
+    logger.info("DNS override: %s -> %s (bypassing ISP hijack)", _SUPABASE_HOST, real_ip)
+
+    _original_getaddrinfo = socket.getaddrinfo
+
+    def _patched_getaddrinfo(host, port, *args, **kwargs):
+        override = _DNS_OVERRIDE.get(host)
+        if override:
+            return _original_getaddrinfo(override, port, *args, **kwargs)
+        return _original_getaddrinfo(host, port, *args, **kwargs)
+
+    socket.getaddrinfo = _patched_getaddrinfo
+
+_bootstrap_dns_override()
+
 DEFAULT_TABLE = os.getenv("SUPABASE_VECTOR_TABLE", "agent_memory")
 DEFAULT_RPC_FN = os.getenv("SUPABASE_VECTOR_MATCH_FN", "match_agent_context")
 DEFAULT_EMBED_DIM = int(os.getenv("SUPABASE_VECTOR_DIM", "768"))
-DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "models/text-embedding-004")
+DEFAULT_EMBED_MODEL = os.getenv("SUPABASE_EMBEDDING_MODEL", "gemini-embedding-001")
 
 
 def build_schema_sql(
@@ -83,7 +129,10 @@ def get_supabase_client() -> Client:
     key = os.getenv("SUPABASE_API_KEY")
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_API_KEY must be set in the environment.")
-    return create_client(url, key)
+    # Use a custom httpx client that skips SSL verification to work around
+    # ISP-level TLS interception (Excitel MITM proxy replaces Supabase certs).
+    options = SyncClientOptions(httpx_client=httpx.Client(verify=False))
+    return create_client(url, key, options=options)
 
 
 class SupabaseVectorDB:
@@ -106,70 +155,34 @@ class SupabaseVectorDB:
 
     @classmethod
     def _init_genai(cls):
-        """Import and configure google.generativeai exactly once."""
+        """Import and configure google.genai Client exactly once."""
         if cls._genai_module is None:
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
                 raise RuntimeError("GOOGLE_API_KEY is required for automatic embeddings.")
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            cls._genai_module = genai
+            from google import genai as _genai
+            cls._genai_module = _genai.Client(api_key=api_key)
         return cls._genai_module
 
     def embed_text(self, text: str, model: Optional[str] = None) -> List[float]:
-        model_candidates: List[str] = []
-        requested_model = model or DEFAULT_EMBED_MODEL
-        for candidate in (requested_model, "models/text-embedding-004", "models/embedding-001"):
-            if candidate and candidate not in model_candidates:
-                model_candidates.append(candidate)
+        """Generate embeddings using google.genai SDK (gemini-embedding-001)."""
+        client = self._init_genai()
+        from google.genai import types as _gentypes
 
-        remote_errors: List[str] = []
+        target_model = model or DEFAULT_EMBED_MODEL
         try:
-            genai = self._init_genai()
-            for candidate in model_candidates:
-                try:
-                    response = genai.embed_content(model=candidate, content=text)
-                    embedding = self._extract_embedding(response)
-                    if embedding:
-                        return self._validate_embedding(embedding)
-                    remote_errors.append(f"{candidate}: empty embedding")
-                except Exception as exc:
-                    remote_errors.append(f"{candidate}: {exc}")
+            response = client.models.embed_content(
+                model=target_model,
+                contents=text,
+                config=_gentypes.EmbedContentConfig(
+                    output_dimensionality=self.embedding_dim,
+                ),
+            )
+            embedding = list(response.embeddings[0].values)
+            return self._validate_embedding(embedding)
         except Exception as exc:
-            remote_errors.append(f"genai init failed: {exc}")
-
-        logger.warning(
-            "Falling back to local deterministic embeddings; remote embedding failed (%s)",
-            " | ".join(remote_errors)[:1500],
-        )
-        return self._local_embedding(text)
-
-    def _extract_embedding(self, response: Any) -> Optional[List[float]]:
-        if isinstance(response, dict):
-            embedding = response.get("embedding")
-            if isinstance(embedding, list):
-                return embedding
-        embedding_attr = getattr(response, "embedding", None)
-        if isinstance(embedding_attr, list):
-            return embedding_attr
-        return None
-
-    def _local_embedding(self, text: str) -> List[float]:
-        tokens = re.findall(r"[a-z0-9_]+", text.lower())
-        if not tokens:
-            return [0.0] * self.embedding_dim
-
-        vector = [0.0] * self.embedding_dim
-        for token in tokens:
-            digest = hashlib.sha256(token.encode("utf-8")).digest()
-            index = int.from_bytes(digest[:4], "big") % self.embedding_dim
-            sign = 1.0 if (digest[4] & 1) == 0 else -1.0
-            vector[index] += sign
-
-        norm = math.sqrt(sum(v * v for v in vector))
-        if norm > 0:
-            vector = [v / norm for v in vector]
-        return vector
+            logger.error("Embedding failed for model %s: %s", target_model, exc)
+            raise RuntimeError(f"Embedding generation failed: {exc}") from exc
 
     def upsert_record(
         self,
