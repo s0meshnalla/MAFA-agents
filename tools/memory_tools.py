@@ -1,8 +1,11 @@
+import logging
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
 from vectordbsupabase import SupabaseVectorDB
+
+logger = logging.getLogger(__name__)
 
 SHARED_AGENT_NAME = "shared_context"
 
@@ -30,7 +33,7 @@ def store_user_context(
             metadata=merged_metadata,
         )
     except Exception as exc:
-        print(f"Error storing context: {exc}")
+        logger.warning("Error storing context for user %s: %s", user_id, exc)
         return ""
 
 
@@ -51,7 +54,7 @@ def retrieve_user_context(
             match_threshold=min_score,
         )
     except Exception as exc:
-        print(f"Error retrieving context: {exc}")
+        logger.warning("Error retrieving context for user %s: %s", user_id, exc)
         return []
 
 
@@ -60,7 +63,7 @@ def supabase_vector_schema_sql() -> str:
     try:
         return vector_db.schema_sql()
     except Exception as exc:
-        print(f"Error generating schema SQL: {exc}")
+        logger.warning("Error generating schema SQL: %s", exc)
         return ""
 
 
@@ -71,18 +74,24 @@ def supabase_vector_schema_sql() -> str:
 
 def _render_rows(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "No recent memory found."
-    return "\n".join(
-        f"- [{row.get('metadata', {}).get('source_agent', 'unknown')}] "
-        f"{row.get('metadata', {}).get('user_message', '')} -> "
-        f"{row.get('metadata', {}).get('agent_response', '')}"
-        for row in rows
-    )
+        return "No relevant memory found."
+    lines = []
+    for row in rows:
+        meta = row.get("metadata", {})
+        source = meta.get("source_agent", "unknown")
+        user_msg = meta.get("user_message", "")
+        agent_msg = meta.get("agent_response", "")
+        if user_msg or agent_msg:
+            lines.append(f"- [{source}] Q: {user_msg} → A: {agent_msg}")
+    return "\n".join(lines) if lines else "No relevant memory found."
 
 
 @tool
 def search_user_memory(query: str, user_id: str) -> str:
-    """Search recent Supabase memory for this user (shared across agents)."""
+    """Search recent Supabase memory for this user (shared across agents).
+
+    Returns the most relevant past interactions matching the query.
+    """
     try:
         emb = vector_db.embed_text(query)
         rows = retrieve_user_context(
@@ -93,21 +102,25 @@ def search_user_memory(query: str, user_id: str) -> str:
             min_score=0.25,
         )
     except Exception as exc:
+        logger.warning("Memory search failed for user %s: %s", user_id, exc)
         return f"Memory search unavailable: {exc}"
     return _render_rows(rows)
 
 
 @tool
 def store_user_note(note: str, user_id: str) -> str:
-    """Store a short note to shared Supabase memory."""
+    """Store a short note to shared Supabase memory (visible to all agents)."""
+    if not note or not note.strip():
+        return "Cannot store an empty note."
     try:
         store_user_context(
             user_id=str(user_id),
-            agent="general_agent",
-            content=note,
-            metadata={"user_message": note, "agent_response": "stored_note"},
+            agent=SHARED_AGENT_NAME,
+            content=note.strip(),
+            metadata={"user_message": note.strip(), "agent_response": "stored_note"},
         )
         return "Saved to memory."
     except Exception as exc:
+        logger.warning("Could not save memory for user %s: %s", user_id, exc)
         return f"Could not save memory: {exc}"
 
