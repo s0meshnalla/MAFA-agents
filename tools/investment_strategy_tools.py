@@ -21,7 +21,6 @@ GET  /portfolio/history?period=&interval= → ApiResponse { data: List<Portfolio
 import contextvars
 import json
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -30,33 +29,19 @@ from langchain_core.tools import tool
 from requests import RequestException
 
 from http_client import get
+from tools._http_helpers import (
+    AuthError, raise_on_auth, make_error_response as _err,
+    fetch_json as _fetch_json, unwrap as _unwrap, API_BASE,
+)
 
 logger = logging.getLogger(__name__)
-
-API_BASE = os.getenv("BROKER_API_URL", "http://localhost:8080")
-
-
-# ---------------------------------------------------------------------------
-# Internal data-fetching helpers (not @tool – agents don't call these directly)
-# ---------------------------------------------------------------------------
-
-def _fetch_json(url: str, timeout: int = 10) -> Any:
-    response = get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-def _unwrap(payload: Any) -> Any:
-    """Unwrap ApiResponse { data: ... } when present."""
-    if isinstance(payload, dict) and "data" in payload:
-        return payload["data"]
-    return payload
 
 
 def _get_preferences() -> Dict:
     try:
         return _unwrap(_fetch_json(f"{API_BASE}/profile/preferences")) or {}
     except Exception as exc:
+        raise_on_auth(exc)
         logger.warning(f"Could not fetch preferences: {exc}")
         return {}
 
@@ -67,6 +52,7 @@ def _get_holdings() -> List[Dict]:
         data = _unwrap(_fetch_json(f"{API_BASE}/holdings"))
         return data if isinstance(data, list) else []
     except Exception as exc:
+        raise_on_auth(exc)
         logger.warning(f"Could not fetch holdings: {exc}")
         return []
 
@@ -77,6 +63,7 @@ def _get_dashboard() -> List[Dict]:
         data = _fetch_json(f"{API_BASE}/dashboard")
         return data if isinstance(data, list) else []
     except Exception as exc:
+        raise_on_auth(exc)
         logger.warning(f"Could not fetch dashboard: {exc}")
         return []
 
@@ -87,6 +74,7 @@ def _get_transactions() -> List[Dict]:
         data = _fetch_json(f"{API_BASE}/transactions")
         return data if isinstance(data, list) else []
     except Exception as exc:
+        raise_on_auth(exc)
         logger.warning(f"Could not fetch transactions: {exc}")
         return []
 
@@ -101,14 +89,16 @@ def _get_stock_price(symbol: str) -> float:
 def _get_companies() -> List[Dict]:
     try:
         return _unwrap(_fetch_json(f"{API_BASE}/companies")) or []
-    except Exception:
+    except Exception as exc:
+        raise_on_auth(exc)
         return []
 
 
 def _get_sectors() -> List[Dict]:
     try:
         return _unwrap(_fetch_json(f"{API_BASE}/sectors")) or []
-    except Exception:
+    except Exception as exc:
+        raise_on_auth(exc)
         return []
 
 
@@ -130,7 +120,8 @@ def _get_active_strategy() -> Dict:
     """Fetch the user's current saved strategy."""
     try:
         return _unwrap(_fetch_json(f"{API_BASE}/strategy")) or {}
-    except Exception:
+    except Exception as exc:
+        raise_on_auth(exc)
         return {}
 
 
@@ -138,7 +129,8 @@ def _get_portfolio_history(period: str = "LAST_30_DAYS", interval: str = "DAILY"
     try:
         data = _unwrap(_fetch_json(f"{API_BASE}/portfolio/history?period={period}&interval={interval}"))
         return data if isinstance(data, list) else []
-    except Exception:
+    except Exception as exc:
+        raise_on_auth(exc)
         return []
 
 
@@ -175,7 +167,10 @@ def assess_risk_tolerance() -> str:
     - GET /transactions         → trade frequency & size distribution
     - GET /dashboard            → position concentration
     """
-    prefs, txns, dashboard = _fetch_parallel(_get_preferences, _get_transactions, _get_dashboard)
+    try:
+        prefs, txns, dashboard = _fetch_parallel(_get_preferences, _get_transactions, _get_dashboard)
+    except AuthError as e:
+        return json.dumps({"error": str(e), "context": "assess risk tolerance"})
 
     # Risk from explicit preference
     risk_setting = prefs.get("riskTolerance", "unknown")
@@ -270,7 +265,10 @@ def analyze_portfolio_alignment(target_strategy: Optional[str] = None) -> str:
 
     Sources: GET /dashboard, GET /profile/preferences
     """
-    dashboard, prefs = _fetch_parallel(_get_dashboard, _get_preferences)
+    try:
+        dashboard, prefs = _fetch_parallel(_get_dashboard, _get_preferences)
+    except AuthError as e:
+        return json.dumps({"error": str(e), "context": "analyze portfolio alignment"})
 
     total_value = sum(d.get("totalAmount", 0) for d in dashboard)
     current: Dict[str, float] = {}
@@ -330,7 +328,10 @@ def generate_personalized_strategy(goal: str, time_horizon: str) -> str:
 
     Sources: GET /profile/preferences
     """
-    prefs = _get_preferences()
+    try:
+        prefs = _get_preferences()
+    except AuthError as e:
+        return json.dumps({"error": str(e), "context": "generate personalized strategy"})
 
     goal_lower = goal.lower().strip()
     horizon = time_horizon.lower().strip()
@@ -391,7 +392,10 @@ def calculate_optimal_allocation(target_allocation: str) -> str:
 
     Sources: GET /dashboard, GET /stockprice
     """
-    dashboard = _get_dashboard()
+    try:
+        dashboard = _get_dashboard()
+    except AuthError as e:
+        return json.dumps({"error": str(e), "context": "calculate optimal allocation"})
     total_value = sum(d.get("totalAmount", 0) for d in dashboard)
 
     try:
@@ -461,7 +465,10 @@ def track_strategy_adherence() -> str:
     Sources: GET /dashboard, GET /profile/preferences, GET /transactions,
              GET /strategy/active, POST /companies/by-symbols, GET /portfolio/history
     """
-    dashboard, prefs, txns = _fetch_parallel(_get_dashboard, _get_preferences, _get_transactions)
+    try:
+        dashboard, prefs, txns = _fetch_parallel(_get_dashboard, _get_preferences, _get_transactions)
+    except AuthError as e:
+        return json.dumps({"error": str(e), "context": "track strategy adherence"})
 
     total_value = sum(d.get("totalAmount", 0) for d in dashboard)
     num_positions = len(dashboard)
