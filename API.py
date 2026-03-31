@@ -22,11 +22,6 @@ from pydantic import BaseModel, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from agents.execution_agent import run_execute_agent  # type: ignore
-from agents.general_agent import run_general_agent  # type: ignore
-from agents.market_search_agent import run_market_research_agent  # type: ignore
-from agents.portfolio_manager_agent import run_portfolio_manager_agent  # type: ignore
-from agents.investment_strategy_agent import run_investment_strategy_agent  # type: ignore
 from mcp_orchestrator import get_mcp_orchestrator
 from event_bus import get_event_bus, MCPTopics, MCPEvent, shutdown_event_bus
 from http_client import set_request_token, init_request_cache, clear_request_cache
@@ -388,62 +383,37 @@ async def get_metrics():
 
 @app.get("/mcp/servers")
 async def list_mcp_servers():
-    """List available MCP servers and their tools."""
-    return {
-        "servers": {
-            "market": {
-                "name": "market-research-server",
-                "tools": [
-                    "predict", "search_live_news",
-                    "get_all_companies", "get_all_sectors",
-                    "get_stock_change", "get_company_by_symbol", "get_bulk_stock_prices",
-                ],
-                "status": "available",
-            },
-            "execution": {
-                "name": "execution-server",
-                "tools": [
-                    "buy_stock", "sell_stock",
-                    "get_user_balance", "get_user_holdings",
-                    "get_current_stock_price", "get_bulk_stock_prices",
-                    "get_stock_change", "get_user_transactions",
-                    "get_company_by_symbol",
-                ],
-                "status": "available",
-            },
-            "portfolio": {
-                "name": "portfolio-server",
-                "tools": [
-                    "get_dashboard", "get_user_holdings", "get_user_balance",
-                    "get_user_preferences", "get_user_transactions",
-                    "get_current_stock_price", "get_bulk_stock_prices",
-                    "get_stock_change", "get_company_by_symbol", "get_companies_by_symbols",
-                    "get_portfolio_history",
-                    "get_watchlist", "add_to_watchlist", "remove_from_watchlist",
-                    "create_alert", "get_alerts", "delete_alert",
-                ],
-                "status": "available",
-            },
-            "strategy": {
-                "name": "strategy-server",
-                "tools": [
-                    "assess_risk_tolerance", "analyze_portfolio_alignment",
-                    "generate_personalized_strategy", "calculate_optimal_allocation",
-                    "track_strategy_adherence",
-                    "get_active_strategy", "get_strategy_history",
-                    "save_strategy", "update_strategy",
-                    "get_portfolio_history", "get_companies_by_symbols",
-                ],
-                "status": "available",
-            },
-            "alerts": {
-                "name": "alerts-server",
-                "tools": [
-                    "create_alert", "get_alerts", "delete_alert",
-                ],
-                "status": "available",
-            },
+    """List available MCP servers and their dynamically discovered tools."""
+    registry = mcp_orchestrator.registry
+    if not registry.is_discovered:
+        return {
+            "status": "not_ready",
+            "message": "Tool discovery has not completed yet. Try again shortly.",
+            "servers": {},
         }
+
+    servers_info = {}
+    for server_key in registry._server_tools:
+        tools = registry.get_tools_for_server(server_key)
+        servers_info[server_key] = {
+            "name": tools[0].server_name if tools else server_key,
+            "tools": [t.name for t in tools],
+            "tool_count": len(tools),
+            "status": "available",
+            "details": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "requires_confirmation": t.requires_confirmation,
+                }
+                for t in tools
+            ],
+        }
+
+    return {
+        "status": "ready",
+        "total_tools": registry.tool_count,
+        "servers": servers_info,
     }
 
 
@@ -469,25 +439,37 @@ async def websocket_stream(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Agent Endpoints (DRY helper eliminates repeated boilerplate)
+# Agent Endpoints — ALL route through the MCP orchestrator pipeline
 # ---------------------------------------------------------------------------
 
-def _run_agent_endpoint(agent_fn, agent_label: str, payload: ExecuteAgentRequest, token: str):
-    """Shared logic for all agent endpoints — eliminates 5x code duplication."""
+async def _run_via_orchestrator(payload: ExecuteAgentRequest, token: str) -> dict:
+    """Route any agent request through the MCP orchestrator pipeline.
+
+    Every endpoint now benefits from dynamic tool discovery, LLM-planned
+    execution, and MCP-protocol tool invocation.  The orchestrator falls
+    back to in-process agents automatically when MCP servers are unavailable.
+    """
     set_request_token(token)
     init_request_cache()
     session_id = payload.sessionId or str(uuid.uuid4())
     try:
-        result = agent_fn(user_message=payload.query, user_id=payload.userId, session_id=session_id)
+        result = await mcp_orchestrator.orchestrate(
+            user_id=payload.userId,
+            query=payload.query,
+            session_id=session_id,
+        )
         return {
-            "data": result,
+            "data": result.get("response", ""),
             "userId": payload.userId,
             "sessionId": session_id,
-            "success": True,
-            "error": None,
+            "success": result.get("success", True),
+            "error": result.get("error"),
+            "routing": result.get("routing", {}),
+            "mcp_servers_used": result.get("mcp_servers_used", []),
+            "execution_time": result.get("execution_time", 0),
         }
     except Exception as exc:
-        logger.error(f"Error executing {agent_label}: {exc}")
+        logger.error(f"MCP orchestrator error: {exc}")
         if _is_upstream_quota_error(exc):
             return {
                 "data": f"Error processing request: {str(exc)}",
@@ -496,38 +478,38 @@ def _run_agent_endpoint(agent_fn, agent_label: str, payload: ExecuteAgentRequest
                 "success": False,
                 "error": str(exc),
             }
-        raise HTTPException(status_code=500, detail=f"Failed to execute {agent_label}") from exc
+        raise HTTPException(status_code=500, detail="Failed to process your request. Please try again later.") from exc
     finally:
         clear_request_cache()
         set_request_token(None)
 
 
 @app.post("/execute-agent")
-def execute_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the execution agent and returns its reply."""
-	return _run_agent_endpoint(run_execute_agent, "execution agent", payload, token)
+async def execute_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint — routes through MCP orchestrator for intelligent tool selection."""
+	return await _run_via_orchestrator(payload, token)
 
 
 @app.post("/investment-strategy-agent")
-def investment_strategy_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the investment strategy agent."""
-	return _run_agent_endpoint(run_investment_strategy_agent, "strategy agent", payload, token)
+async def investment_strategy_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint — routes through MCP orchestrator for intelligent tool selection."""
+	return await _run_via_orchestrator(payload, token)
 
 @app.post("/market-research-agent")
-def market_research_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the market research agent and returns its reply."""
-	return _run_agent_endpoint(run_market_research_agent, "market research agent", payload, token)
+async def market_research_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint — routes through MCP orchestrator for intelligent tool selection."""
+	return await _run_via_orchestrator(payload, token)
 
 
 @app.post("/general-agent")
-def general_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the general agent and returns its reply."""
-	return _run_agent_endpoint(run_general_agent, "general agent", payload, token)
-  
+async def general_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint — routes through MCP orchestrator for intelligent tool selection."""
+	return await _run_via_orchestrator(payload, token)
+
 @app.post("/portfolio-manager-agent")
-def portfolio_manager_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
-	"""HTTP endpoint that runs the portfolio manager agent and returns its reply."""
-	return _run_agent_endpoint(run_portfolio_manager_agent, "portfolio manager agent", payload, token)
+async def portfolio_manager_agent_endpoint(payload: ExecuteAgentRequest, token: str = Depends(get_token)):
+	"""HTTP endpoint — routes through MCP orchestrator for intelligent tool selection."""
+	return await _run_via_orchestrator(payload, token)
 
 
 @app.post("/mcp/query")

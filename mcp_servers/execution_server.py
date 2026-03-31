@@ -18,12 +18,42 @@ from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
 
-# Import existing tools
-from tools.execute_trade_tools import execute_trade_order
+# Bridge auth token from parent process → this subprocess
+from http_client import set_request_token
+_auth_token = os.environ.get("MAFA_AUTH_TOKEN")
+if _auth_token:
+    set_request_token(_auth_token)
+
+# Import existing tools (these are LangChain StructuredTool objects — use .invoke())
+from tools.execute_trade_tools import buy_stock, sell_stock
 from tools.profile_tools import get_user_balance, get_user_holdings, get_current_stock_price
 
 # Create TRUE MCP Server
 mcp = FastMCP("execution-server")
+
+
+# ---------------------------------------------------------------------------
+# Helper: safely call a LangChain StructuredTool
+# ---------------------------------------------------------------------------
+import inspect
+
+
+def _call_tool(tool_obj, params: dict = None):
+    """Invoke a LangChain @tool-decorated function safely.
+
+    Calls the underlying function directly via tool_obj.func to bypass
+    StructuredTool wrapper issues. Uses inspect.signature to pass only
+    accepted parameters.
+    """
+    fn = getattr(tool_obj, 'func', None)
+    if fn is not None and callable(fn):
+        if params:
+            sig = inspect.signature(fn)
+            accepted = {k: v for k, v in params.items() if k in sig.parameters}
+            return fn(**accepted)
+        return fn()
+    # Fallback: try invoke
+    return tool_obj.invoke(params or {})
 
 
 @mcp.tool()
@@ -54,18 +84,11 @@ def execute_trade(symbol: str, quantity: int, action: str) -> str:
         })
     
     try:
-        order_data = {
-            "symbol": symbol,
-            "quantity": quantity
-        }
-        result = execute_trade_order(order_data, action)
-        return json.dumps({
-            "order_id": result,
-            "symbol": symbol,
-            "quantity": quantity,
-            "action": action,
-            "success": True
-        })
+        if action == "buy":
+            result = _call_tool(buy_stock, {"symbol": symbol, "quantity": quantity})
+        else:
+            result = _call_tool(sell_stock, {"symbol": symbol, "quantity": quantity})
+        return result if isinstance(result, str) else json.dumps(result)
     except Exception as exc:
         return json.dumps({
             "error": str(exc),
@@ -84,9 +107,15 @@ def check_balance() -> str:
         JSON string with current balance or error message
     """
     try:
-        balance = get_user_balance()
+        result = _call_tool(get_user_balance)
+        balance = json.loads(result) if isinstance(result, str) else result
+        # Handle both raw number and dict responses
+        if isinstance(balance, dict):
+            bal_val = float(balance.get("balance", balance.get("data", 0)))
+        else:
+            bal_val = float(balance)
         return json.dumps({
-            "balance": float(balance),
+            "balance": bal_val,
             "currency": "USD",
             "success": True
         })
@@ -105,7 +134,8 @@ def check_holdings() -> str:
         JSON string with holdings dictionary or error message
     """
     try:
-        holdings = get_user_holdings()
+        result = _call_tool(get_user_holdings)
+        holdings = json.loads(result) if isinstance(result, str) else result
         return json.dumps({
             "holdings": holdings,
             "success": True
@@ -130,10 +160,15 @@ def get_stock_price(symbol: str) -> str:
     symbol = symbol.upper().strip()
     
     try:
-        price = get_current_stock_price(symbol)
+        result = _call_tool(get_current_stock_price, {"symbol": symbol})
+        price = json.loads(result) if isinstance(result, str) else result
+        if isinstance(price, dict):
+            price_val = float(price.get("price", price.get("data", 0)))
+        else:
+            price_val = float(price)
         return json.dumps({
             "symbol": symbol,
-            "price": float(price),
+            "price": price_val,
             "currency": "USD",
             "success": True
         })
@@ -170,9 +205,14 @@ def validate_trade(symbol: str, quantity: int, action: str) -> str:
     
     try:
         if action == "buy":
-            # Check balance
-            balance = get_user_balance()
-            price = get_current_stock_price(symbol)
+            bal_result = _call_tool(get_user_balance)
+            balance_raw = json.loads(bal_result) if isinstance(bal_result, str) else bal_result
+            balance = float(balance_raw.get("balance", balance_raw.get("data", balance_raw)) if isinstance(balance_raw, dict) else balance_raw)
+
+            price_result = _call_tool(get_current_stock_price, {"symbol": symbol})
+            price_raw = json.loads(price_result) if isinstance(price_result, str) else price_result
+            price = float(price_raw.get("price", price_raw.get("data", price_raw)) if isinstance(price_raw, dict) else price_raw)
+
             total_cost = price * quantity
             
             if total_cost > balance:
@@ -185,9 +225,19 @@ def validate_trade(symbol: str, quantity: int, action: str) -> str:
                 validation["remaining_balance"] = balance - total_cost
                 
         elif action == "sell":
-            # Check holdings
-            holdings = get_user_holdings()
-            current_qty = holdings.get(symbol, 0)
+            hold_result = _call_tool(get_user_holdings)
+            holdings = json.loads(hold_result) if isinstance(hold_result, str) else hold_result
+            # Holdings can be a list of {symbol, quantity, ...} or a dict
+            if isinstance(holdings, list):
+                current_qty = next(
+                    (int(h.get("quantity", 0)) for h in holdings
+                     if isinstance(h, dict) and h.get("symbol", "").upper() == symbol),
+                    0
+                )
+            elif isinstance(holdings, dict):
+                current_qty = int(holdings.get(symbol, 0))
+            else:
+                current_qty = 0
             
             if current_qty < quantity:
                 validation["valid"] = False
@@ -195,7 +245,9 @@ def validate_trade(symbol: str, quantity: int, action: str) -> str:
                     f"Insufficient shares. Own {current_qty}, trying to sell {quantity}"
                 )
             else:
-                price = get_current_stock_price(symbol)
+                price_result = _call_tool(get_current_stock_price, {"symbol": symbol})
+                price_raw = json.loads(price_result) if isinstance(price_result, str) else price_result
+                price = float(price_raw.get("price", price_raw.get("data", price_raw)) if isinstance(price_raw, dict) else price_raw)
                 validation["estimated_proceeds"] = price * quantity
         else:
             validation["valid"] = False

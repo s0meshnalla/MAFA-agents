@@ -1,7 +1,16 @@
-"""TRUE MCP Orchestrator - Official MCP Protocol Integration.
+"""TRUE MCP Orchestrator — LLM-planned, protocol-native MCP orchestration.
 
-Replaces keyword-based routing with TRUE MCP stdio client connections.
-Coordinates multiple MCP servers and provides unified query interface.
+Replaces the old 3-tier keyword/heuristic/shallow-LLM router with a
+genuine MCP-powered pipeline:
+
+    User Query  →  Tool Discovery  →  LLM Query Planner  →  MCP Executor  →  LLM Synthesizer  →  Response
+
+Key capabilities:
+  • Dynamic tool discovery from MCP servers at startup (via mcp_tool_registry)
+  • LLM reasons over the FULL tool catalog to produce execution plans (via query_planner)
+  • Tools invoked via actual MCP stdio protocol with parallel execution (via mcp_executor)
+  • Structured result synthesis with all tool outputs available
+  • Graceful degradation to in-process agents when MCP servers are unavailable
 """
 
 from __future__ import annotations
@@ -13,19 +22,19 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-
-from mcp import ClientSession
-from mcp.client.stdio import stdio_client, StdioServerParameters
 
 from agents.base import model as _shared_model, sanitize_user_response
 from vectordbsupabase import SupabaseVectorDB
 from tools.memory_tools import store_user_context
 from event_bus import MCPTopics, get_event_bus
 from http_client import get
+
+from mcp_tool_registry import MCPToolRegistry, get_tool_registry
+from query_planner import QueryPlanner, ExecutionPlan
+from mcp_executor import MCPExecutor, PlanExecutionResult
 
 load_dotenv()
 
@@ -34,233 +43,482 @@ logger = logging.getLogger(__name__)
 
 BROKER_API_URL = os.getenv("BROKER_API_URL", "http://localhost:8080")
 
-# ---------------------------------------------------------------------------
-# MCP Server Configurations
-# ---------------------------------------------------------------------------
-
-MCP_SERVERS = {
-    "market": {
-        "name": "market-research-server",
-        "command": ["python", "mcp_servers/market_research_server.py"],
-        "description": "LSTM predictions and live news search",
-    },
-    "execution": {
-        "name": "execution-server",
-        "command": ["python", "mcp_servers/execution_server.py"],
-        "description": "Trade execution and balance checking",
-    },
-    "portfolio": {
-        "name": "portfolio-server",
-        "command": ["python", "mcp_servers/portfolio_server.py"],
-        "description": "Portfolio analysis and risk metrics",
-    },
-    "strategy": {
-        "name": "strategy-server",
-        "command": ["python", "mcp_servers/strategy_server.py"],
-        "description": "Investment recommendations and rebalancing",
-    },
-}
-
-
-@dataclass
-class IntentRouteDecision:
-    """Structured router decision returned by semantic intent classification."""
-
-    primary_agents: List[str]
-    secondary_agents: List[str]
-    confidence: float
-    requires_clarification: bool
-    fallback_route: str
-    rationale_short: str
-
-
-ALLOWED_SERVER_KEYS = {"market", "execution", "portfolio", "strategy", "general"}
-_TICKER_PATTERNS = (
-    re.compile(r"\b(?:for|of|in|about)\s+([A-Za-z]{1,5})\b"),
-    re.compile(r"\b([A-Z]{1,5})\b"),
-)
-_TICKER_COMMON_WORDS = {
-    "I", "A", "AN", "THE", "AND", "OR", "FOR", "TO", "OF", "IN", "ON", "AT",
-    "MY", "ME", "YOU", "ALL", "CAN", "WILL", "THIS", "THAT", "WITH", "FROM",
-    "WHAT", "WHEN", "SHOW", "GIVE", "MOST", "BEST", "NEXT", "STOCK", "PRICE",
-    "BUY", "SELL", "QUOTE", "NEWS", "PLAN", "RISK", "GUIDE",
-}
-
 
 # ---------------------------------------------------------------------------
 # TRUE MCP Orchestrator
 # ---------------------------------------------------------------------------
 
 class TrueMCPOrchestrator:
-    """TRUE MCP Orchestrator with official MCP protocol integration."""
-    
+    """TRUE MCP Orchestrator with dynamic tool discovery, LLM planning,
+    and protocol-native execution.
+
+    Architecture
+    ------------
+    1. **Tool Registry** discovers all MCP tools at startup via stdio.
+    2. **Query Planner** (LLM) reads the full tool catalog and produces
+       a structured execution plan for each user query.
+    3. **MCP Executor** runs the plan — invoking tools via MCP protocol
+       with support for parallel execution and per-tool timeouts.
+    4. **Synthesizer** (LLM) merges tool results into a cohesive user response.
+    5. **Fallback** — if MCP execution fails, falls back to in-process agents.
+    """
+
     def __init__(self):
         self.vector_db = SupabaseVectorDB()
         self.event_bus = get_event_bus()
         self._company_cache: List[Dict[str, Any]] = []
         self._company_cache_ts: float = 0.0
-        
-        # Reuse the shared model from agents.base (avoid creating a duplicate LLM instance)
+
+        # Core pipeline components
+        self.registry = get_tool_registry()
         self.llm = _shared_model
-        self.semantic_router_enabled = os.getenv("SEMANTIC_ROUTER_ENABLED", "true").strip().lower() != "false"
-        self.semantic_router_min_confidence = self._read_float_env("SEMANTIC_ROUTER_MIN_CONFIDENCE", 0.35)
-        self.semantic_router_secondary_min_confidence = self._read_float_env("SEMANTIC_ROUTER_SECONDARY_MIN_CONFIDENCE", 0.55)
-        self.mcp_transport_enabled = os.getenv("MCP_TRANSPORT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-        
+        self.planner: Optional[QueryPlanner] = None
+        self.executor: Optional[MCPExecutor] = None
+
         self._initialized = False
 
-    @staticmethod
-    def _read_float_env(name: str, default: float) -> float:
-        """Read a float env var with a safe default."""
-        value = os.getenv(name)
-        if value is None:
-            return default
-        try:
-            return float(value)
-        except ValueError:
-            return default
-    
+    # -- Lifecycle ----------------------------------------------------------
+
     async def initialize(self) -> None:
-        """Initialize MCP connections and agent."""
+        """Initialize MCP connections, tool discovery, and pipeline."""
         if self._initialized:
             return
-        
-        logger.info("Initializing TrueMCPOrchestrator...")
-        
+
+        logger.info("Initializing TrueMCPOrchestrator …")
+
         # Connect to event bus
         await self.event_bus.connect()
-        
-        # Note: MCP server connections are established per-request
-        # due to the async context manager pattern of stdio_client
-        
+
+        # Discover tools from all MCP servers
+        try:
+            await self.registry.discover_all()
+            logger.info(
+                "Tool discovery complete: %d tools found across %d servers",
+                self.registry.tool_count,
+                len(self.registry._server_tools),
+            )
+        except Exception as exc:
+            logger.warning("Tool discovery failed: %s — will use fallback agents", exc)
+
+        # Initialize the planner and executor
+        self.planner = QueryPlanner(self.registry, llm=self.llm)
+        self.executor = MCPExecutor(self.registry)
+
         self._initialized = True
         logger.info("TrueMCPOrchestrator initialized")
-    
+
     async def shutdown(self) -> None:
         """Shutdown all connections."""
         await self.event_bus.disconnect()
         self._initialized = False
-    
+
+    # -- Main orchestration entry point -------------------------------------
+
     async def orchestrate(
         self,
         user_id: int,
         query: str,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Main orchestration workflow using TRUE MCP.
-        
+        """Main orchestration workflow — true MCP pipeline.
+
+        Pipeline:
+            1. Company support check (broker compatibility)
+            2. LLM Query Planner → structured execution plan
+            3. Confirmation check for trade tools
+            4. MCP Executor → parallel tool invocation
+            5. LLM Synthesizer → cohesive user response
+            6. Fallback to in-process agents on MCP failure
+
         Args:
             user_id: User ID
             query: User query
             session_id: Optional session ID
-            
+
         Returns:
             Orchestration result with response and metadata
         """
         start_time = time.time()
-        
-        # Auto-generate session_id if not provided
+
         if not session_id:
             session_id = str(uuid.uuid4())
-        
-        logger.info(f"MCP orchestration started: user_id={user_id}, query={query[:50]}...")
-        
+
+        logger.info(
+            "MCP orchestration started: user_id=%s, query=%.80s…",
+            user_id, query,
+        )
+
         # Publish query event
         await self.event_bus.publish_raw(
             MCPTopics.MCP_QUERY,
             user_id,
             {"query": query, "session_id": session_id},
         )
-        
+
         try:
-            # 0. Ensure referenced company is supported by broker
+            # 0. Company support pre-check
             company_block = await self._check_company_support(query)
             if company_block:
                 from agents.general_agent import run_general_agent_no_broker
                 general_response = run_general_agent_no_broker(query, user_id, session_id)
                 combined = general_response or company_block
-                await self.event_bus.publish_raw(
-                    MCPTopics.MCP_RESULTS,
-                    user_id,
-                    {
-                        "query": query,
-                        "response": combined,
-                        "servers_used": [],
-                        "session_id": session_id,
-                    },
+                await self._publish_result(user_id, query, combined, [], session_id)
+                return self._build_response(combined, [], {}, True, start_time, user_id, session_id)
+
+            # 1. Plan — LLM reasons over full tool catalog
+            plan = self.planner.plan(query, user_id) if self.planner else None
+
+            if plan is None or (not plan.steps and plan.is_general_query):
+                # General/greeting or planner unavailable → agent fallback
+                response = await self._run_fallback_agent(
+                    plan.fallback_agent if plan else "general",
+                    query, user_id, session_id,
                 )
-                return {
-                    "response": combined,
-                    "mcp_servers_used": [],
-                    "success": True,
-                    "execution_time": time.time() - start_time,
-                    "user_id": user_id,
-                    "session_id": session_id,
+                routing = {
+                    "source": "fallback_agent",
+                    "reason": plan.reasoning if plan else "planner unavailable",
+                    "agent": plan.fallback_agent if plan else "general",
+                }
+                await self._publish_result(user_id, query, response, [], session_id, routing)
+                return self._build_response(response, [], routing, True, start_time, user_id, session_id)
+
+            # 2. Confirmation check for trade tools
+            if plan.requires_confirmation and plan.has_trade_tools:
+                confirm_msg = plan.confirmation_message or self._build_confirmation_message(plan)
+                routing = {
+                    "source": "planner",
+                    "awaiting_confirmation": True,
+                    "planned_tools": plan.tool_names,
+                    "servers": plan.server_keys,
+                }
+                return self._build_response(confirm_msg, plan.server_keys, routing, True, start_time, user_id, session_id)
+
+            # 3. Execute — invoke tools via MCP protocol
+            exec_result = await self._execute_plan(plan)
+
+            if exec_result and exec_result.success:
+                # 4. Synthesize — LLM merges tool outputs
+                response = self._synthesize_tool_results(
+                    query, plan, exec_result,
+                )
+                response = sanitize_user_response(response, user_message=query)
+
+                routing = {
+                    "source": "mcp_pipeline",
+                    "tools_called": exec_result.tools_called,
+                    "servers_used": exec_result.servers_used,
+                    "plan_confidence": plan.confidence,
+                    "plan_reasoning": plan.reasoning,
+                    "execution_time": exec_result.total_time,
+                    "partial_failure": exec_result.partial_failure,
                 }
 
-            # 1. Run agent with MCP tools
-            result = await self._run_agent(user_id, query, session_id)
-            
-            # 2. Save conversation turn
-            await self._save_turn(user_id, query, result["response"])
-            
-            # 3. Publish result event
-            await self.event_bus.publish_raw(
-                MCPTopics.MCP_RESULTS,
-                user_id,
-                {
-                    "query": query,
-                    "response": result["response"],
-                    "servers_used": result.get("mcp_servers_used", []),
-                    "routing": result.get("routing", {}),
-                    "session_id": session_id,
-                },
-            )
-            
-            result["execution_time"] = time.time() - start_time
-            result["user_id"] = user_id
-            result["session_id"] = session_id
-            
-            logger.info(f"MCP orchestration complete in {result['execution_time']:.2f}s")
-            return result
-            
+                error_msg = self._extract_response_error(response)
+                success = error_msg is None
+
+                await self._save_turn(user_id, query, response)
+                await self._publish_result(
+                    user_id, query, response,
+                    exec_result.servers_used, session_id, routing,
+                )
+
+                result = self._build_response(
+                    response, exec_result.servers_used, routing,
+                    success, start_time, user_id, session_id,
+                )
+                result["error"] = error_msg
+                return result
+
+            # 5. MCP execution returned partial data — still try to synthesize
+            if exec_result and exec_result.results:
+                any_data = any(r.success and r.data for r in exec_result.results)
+                if any_data:
+                    logger.info("MCP partial success — synthesizing available results")
+                    response = self._synthesize_tool_results(
+                        query, plan, exec_result,
+                    )
+                    response = sanitize_user_response(response, user_message=query)
+                    routing = {
+                        "source": "mcp_pipeline",
+                        "tools_called": exec_result.tools_called,
+                        "servers_used": exec_result.servers_used,
+                        "plan_confidence": plan.confidence,
+                        "execution_time": exec_result.total_time,
+                        "partial_failure": True,
+                    }
+                    await self._save_turn(user_id, query, response)
+                    await self._publish_result(
+                        user_id, query, response,
+                        exec_result.servers_used, session_id, routing,
+                    )
+                    return self._build_response(
+                        response, exec_result.servers_used, routing,
+                        True, start_time, user_id, session_id,
+                    )
+
+            # 6. MCP execution fully failed → fallback to in-process agents
+            logger.warning("MCP execution failed — falling back to in-process agents")
+            response = await self._run_plan_as_agents(plan, query, user_id, session_id)
+            response = sanitize_user_response(response, user_message=query)
+
+            routing = {
+                "source": "agent_fallback",
+                "reason": "MCP execution failed",
+                "planned_tools": plan.tool_names,
+                "servers": plan.server_keys,
+            }
+            await self._save_turn(user_id, query, response)
+            await self._publish_result(user_id, query, response, plan.server_keys, session_id, routing)
+            return self._build_response(response, plan.server_keys, routing, True, start_time, user_id, session_id)
+
         except Exception as exc:
-            logger.error(f"MCP orchestration error: {exc}")
-            
-            # Publish error event
+            logger.error("MCP orchestration error: %s", exc)
             await self.event_bus.publish_raw(
                 MCPTopics.MCP_ERRORS,
                 user_id,
                 {"query": query, "error": str(exc)},
             )
-            
             return {
                 "response": f"Error processing request: {str(exc)}",
                 "success": False,
                 "error": str(exc),
                 "execution_time": time.time() - start_time,
             }
-    
+
+    # -- Execution ----------------------------------------------------------
+
+    async def _execute_plan(self, plan: ExecutionPlan) -> Optional[PlanExecutionResult]:
+        """Execute the plan via MCP protocol (with parallel support)."""
+        if not self.executor or not plan.steps:
+            return None
+
+        try:
+            return await self.executor.execute(plan)
+        except Exception as exc:
+            logger.error("MCP plan execution error: %s", exc)
+            return None
+
+    async def _run_fallback_agent(
+        self,
+        agent_key: Optional[str],
+        query: str,
+        user_id: int,
+        session_id: str,
+    ) -> str:
+        """Run an in-process agent as a fallback."""
+        handlers = self._get_agent_handlers()
+        handler = handlers.get(agent_key or "general", handlers["general"])
+        try:
+            return handler(query, user_id, session_id)
+        except Exception as exc:
+            logger.error("Fallback agent '%s' error: %s", agent_key, exc)
+            return f"Error processing request: {str(exc)}"
+
+    async def _run_plan_as_agents(
+        self,
+        plan: ExecutionPlan,
+        query: str,
+        user_id: int,
+        session_id: str,
+    ) -> str:
+        """Use the plan's server_keys to run in-process agents as MCP fallback."""
+        handlers = self._get_agent_handlers()
+        servers = plan.server_keys or ["general"]
+
+        if len(servers) == 1:
+            handler = handlers.get(servers[0], handlers["general"])
+            return handler(query, user_id, session_id)
+
+        # Multiple servers → run each agent and synthesize
+        responses: Dict[str, str] = {}
+        for server in servers:
+            handler = handlers.get(server)
+            if handler:
+                try:
+                    responses[server] = handler(query, user_id, session_id)
+                except Exception as exc:
+                    logger.warning("Agent fallback '%s' error: %s", server, exc)
+
+        if not responses:
+            return handlers["general"](query, user_id, session_id)
+
+        if len(responses) == 1:
+            return list(responses.values())[0]
+
+        return self._synthesize_agent_responses(query, responses)
+
+    @staticmethod
+    def _get_agent_handlers() -> Dict[str, Any]:
+        """Lazy import and return all in-process agent handler functions."""
+        from agents.market_search_agent import run_market_research_agent
+        from agents.execution_agent import run_execute_agent
+        from agents.portfolio_manager_agent import run_portfolio_manager_agent
+        from agents.investment_strategy_agent import run_investment_strategy_agent
+        from agents.general_agent import run_general_agent
+        return {
+            "market": run_market_research_agent,
+            "execution": run_execute_agent,
+            "portfolio": run_portfolio_manager_agent,
+            "strategy": run_investment_strategy_agent,
+            "general": run_general_agent,
+        }
+
+    # -- Synthesis ----------------------------------------------------------
+
+    def _synthesize_tool_results(
+        self,
+        query: str,
+        plan: ExecutionPlan,
+        exec_result: PlanExecutionResult,
+    ) -> str:
+        """Use LLM to synthesize MCP tool results into a cohesive user response."""
+        tool_data = exec_result.get_combined_data_text()
+
+        if not tool_data.strip():
+            return "I wasn't able to retrieve the data needed. Please try rephrasing your question."
+
+        # If only one tool was called and succeeded, and the output is
+        # already well-structured, use an abbreviated synthesis prompt
+        successful = [r for r in exec_result.results if r.success]
+        if len(successful) == 1:
+            synthesis = self._quick_synthesis(query, successful[0])
+            if synthesis:
+                return synthesis
+
+        # Full synthesis prompt for multi-tool results
+        prompt = f"""You are MAFA, a Multi-Agent Financial Advisor. You have just gathered data
+from multiple financial analysis tools. Synthesize all the tool outputs below into
+ONE clear, cohesive response for the user.
+
+Rules:
+1. Lead with the most actionable insight.
+2. Merge overlapping data — don't repeat the same numbers twice.
+3. Use dollar amounts and percentages where appropriate.
+4. Keep the response concise: 4-8 sentences plus optional bullets.
+5. If any tool failed, note what data is unavailable.
+6. End with one clear next step or question for the user.
+7. Never mention internal tools, MCP servers, backend processes, or system internals.
+8. Never mention tool names, server keys, or technical pipeline details.
+
+User Query: {query}
+
+Plan reasoning: {plan.reasoning}
+Synthesis hint: {plan.synthesis_hint}
+
+Tool Results:
+{tool_data}
+
+Provide a unified, user-friendly response:"""
+
+        try:
+            result = self.llm.invoke(prompt)
+            text = str(result.content) if hasattr(result, "content") else str(result)
+            return text.strip() if text.strip() else "I processed your request but couldn't formulate a response. Please try again."
+        except Exception as exc:
+            logger.warning("Synthesis LLM failed: %s — returning raw data", exc)
+            # Graceful degradation: return raw tool outputs
+            return tool_data
+
+    def _quick_synthesis(self, query: str, result) -> Optional[str]:
+        """Fast synthesis for single-tool results that are already user-friendly."""
+        data = result.data
+        if not data:
+            return None
+
+        # Try to parse as JSON and provide a quick formatted summary
+        try:
+            parsed = json.loads(data)
+            if isinstance(parsed, dict) and parsed.get("success") is False:
+                error = parsed.get("error", "Unknown error")
+                return f"Sorry, I couldn't complete that: {error}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # For single-tool results, use a focused synthesis prompt
+        prompt = f"""You are MAFA, a financial advisor. The user asked: "{query}"
+
+Here is the data retrieved:
+{data}
+
+Provide a clear, concise response (3-5 sentences). Lead with the key insight.
+Do not mention internal tools, backends, or system details."""
+
+        try:
+            result = self.llm.invoke(prompt)
+            text = str(result.content) if hasattr(result, "content") else str(result)
+            return text.strip() if text.strip() else None
+        except Exception:
+            return None
+
+    def _synthesize_agent_responses(self, query: str, responses: Dict[str, str]) -> str:
+        """Synthesize multiple in-process agent responses (fallback path)."""
+        if len(responses) == 1:
+            return list(responses.values())[0]
+
+        prompt = f"""You are MAFA, synthesising multiple specialist agent responses into one unified answer for the user.
+
+Rules:
+1. Merge overlapping insights — don't repeat the same data twice.
+2. Resolve any contradictions by noting both perspectives briefly.
+3. Lead with the most actionable insight, then supporting details.
+4. Keep the total response concise (aim for 4-8 sentences + optional bullets).
+5. End with one clear next step or question for the user.
+6. Never mention internal systems, tool calls, memory stores, prompts, or backend process details.
+
+User Query: {query}
+
+Agent Responses:
+"""
+        for server, response in responses.items():
+            prompt += f"\n--- {server.upper()} ---\n{response}\n"
+
+        prompt += "\nProvide a unified response that integrates all insights:"
+
+        try:
+            result = self.llm.invoke(prompt)
+            text = str(result.content) if hasattr(result, "content") else str(result)
+            return sanitize_user_response(text, user_message=query)
+        except Exception:
+            return sanitize_user_response(
+                "\n\n".join(f"**{k.title()}**: {v}" for k, v in responses.items()),
+                user_message=query,
+            )
+
+    def _build_confirmation_message(self, plan: ExecutionPlan) -> str:
+        """Build a user-facing confirmation prompt for trade tools."""
+        trade_steps = [s for s in plan.steps if s.tool_name == "execute_trade"]
+        if not trade_steps:
+            return "Please confirm you'd like to proceed with this action."
+
+        parts = []
+        for step in trade_steps:
+            symbol = step.params.get("symbol", "?")
+            quantity = step.params.get("quantity", "?")
+            action = step.params.get("action", "?").upper()
+            parts.append(f"{action} {quantity} shares of {symbol}")
+
+        actions = " and ".join(parts)
+        return (
+            f"I'm ready to {actions}. "
+            f"Please confirm by saying 'Yes, proceed' or 'Confirm'. "
+            f"Note: Market prices can change between now and execution."
+        )
+
+    # -- Company support check (preserved from original) --------------------
+
     async def _check_company_support(self, query: str) -> Optional[str]:
         """Return a user-facing message if the company isn't supported by the broker."""
         query_text = (query or "").strip()
         if not query_text:
             return None
 
-        # Prediction/forecast queries are handled by market agent logic,
-        # including supported/unavailable ticker responses.
         q_pred = query_text.lower()
         if any(k in q_pred for k in ("predict", "prediction", "forecast", "next-day", "next day")):
             return None
 
-        # Price lookup queries should be handled by market/general paths,
-        # including non-broker fallback data sources.
         if any(k in q_pred for k in ("stock price", "price of", "current price", "quote")):
             return None
 
-        # Skip check for queries about the user's own account / portfolio.
-        # These contain financial words ("stock", "shares") but are NOT about
-        # a specific unsupported company.
         _account_kw = [
             "my portfolio", "my holdings", "my stock", "my shares",
             "my balance", "my watchlist", "my transactions", "my position",
@@ -309,39 +567,46 @@ class TrueMCPOrchestrator:
             "but it might be in the future. Please keep an eye out for updates."
         )
 
-    def _query_mentions_company(self, query: str) -> bool:
-        """Heuristic to detect whether a query is about a specific company/ticker."""
-        q = query.lower()
-        keywords = [
-            "stock",
-            "shares",
-            "price",
-            "buy",
-            "sell",
-            "trade",
-            "ticker",
-            "symbol",
-            "company",
-            "invest",
-        ]
-        if any(word in q for word in keywords):
-            return True
+    @staticmethod
+    def _query_mentions_company(query: str) -> bool:
+        """Detect whether a query references a SPECIFIC company or ticker.
 
-        # Match uppercase tokens that look like tickers (2-5 letters),
-        # excluding common English words that are all-caps by convention.
-        _COMMON_WORDS = {"I", "A", "AM", "AN", "AS", "AT", "BE", "BY", "DO",
-                         "GO", "HE", "IF", "IN", "IS", "IT", "ME", "MY", "NO",
-                         "OF", "OK", "ON", "OR", "SO", "TO", "UP", "US", "WE",
-                         "THE", "AND", "BUT", "FOR", "NOT", "YOU", "ALL", "CAN",
-                         "HER", "WAS", "ONE", "OUR", "OUT", "HAS", "HIS", "HOW",
-                         "ITS", "LET", "MAY", "NEW", "NOW", "OLD", "SEE", "WAY",
-                         "WHO", "DID", "GET", "HIM", "HIT", "HAD", "SAY", "SHE",
-                         "TOO", "USE", "DAD", "MOM", "SET", "RUN", "TRY", "ASK",
-                         "MEN", "RAN", "ANY", "DAY", "FEW", "GOT", "END",
-                         "WHAT", "WHEN", "WILL", "WITH", "THIS", "THAT", "FROM",
-                         "HAVE", "BEEN", "WANT", "SOME", "MUCH", "MANY", "ALSO",
-                         "BEST", "LAST", "NEXT", "HELP", "SHOW", "TELL", "GIVE",
-                         "MAKE", "LIKE", "LOOK", "NEED", "DOES", "THAN"}
+        This must be conservative — it should NOT trigger on generic financial
+        queries like "promising stocks" or "investment guide".  It should only
+        trigger when there's an actual ticker-like token (2-5 uppercase letters)
+        that isn't a common English word.
+        """
+        # Generic financial phrases should NEVER trigger company check
+        _GENERIC_PHRASES = [
+            "promising stocks", "best stocks", "top stocks", "worst stocks",
+            "invest in", "investment guide", "investment strategy",
+            "market trends", "market analysis", "stock market",
+            "portfolio", "rebalance", "diversify", "allocation",
+            "most promising", "which stocks", "what stocks",
+            "based on", "recommend", "suggestion",
+        ]
+        q_lower = query.lower()
+        if any(phrase in q_lower for phrase in _GENERIC_PHRASES):
+            return False
+
+        # Look for specific ticker-like tokens (2-5 uppercase letters)
+        _COMMON_WORDS = {
+            "I", "A", "AM", "AN", "AS", "AT", "BE", "BY", "DO",
+            "GO", "HE", "IF", "IN", "IS", "IT", "ME", "MY", "NO",
+            "OF", "OK", "ON", "OR", "SO", "TO", "UP", "US", "WE",
+            "THE", "AND", "BUT", "FOR", "NOT", "YOU", "ALL", "CAN",
+            "HER", "WAS", "ONE", "OUR", "OUT", "HAS", "HIS", "HOW",
+            "ITS", "LET", "MAY", "NEW", "NOW", "OLD", "SEE", "WAY",
+            "WHO", "DID", "GET", "HIM", "HIT", "HAD", "SAY", "SHE",
+            "TOO", "USE", "DAD", "MOM", "SET", "RUN", "TRY", "ASK",
+            "MEN", "RAN", "ANY", "DAY", "FEW", "GOT", "END",
+            "WHAT", "WHEN", "WILL", "WITH", "THIS", "THAT", "FROM",
+            "HAVE", "BEEN", "WANT", "SOME", "MUCH", "MANY", "ALSO",
+            "BEST", "LAST", "NEXT", "HELP", "SHOW", "TELL", "GIVE",
+            "MAKE", "LIKE", "LOOK", "NEED", "DOES", "THAN",
+            "BUY", "SELL", "HOLD", "PUT", "CALL", "ETF", "IPO",
+            "ATH", "CEO", "CFO", "GDP", "FED", "SEC",
+        }
         for token in re.findall(r"\b[A-Z]{2,5}\b", query):
             if token not in _COMMON_WORDS:
                 return True
@@ -363,178 +628,11 @@ class TrueMCPOrchestrator:
                 self._company_cache_ts = now
                 return data
         except Exception as exc:
-            logger.warning(f"Company catalog lookup failed: {exc}")
+            logger.warning("Company catalog lookup failed: %s", exc)
 
         return []
-    
-    async def _run_agent(
-        self,
-        user_id: int,
-        query: str,
-        session_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Run LangChain agent with MCP tools.
-        
-        For now, we use a simplified approach that doesn't require
-        maintaining persistent MCP server connections, which is complex
-        with stdio transport. Instead, we use the existing tool implementations
-        directly while maintaining the MCP architecture.
-        """
-        # For this implementation, we use the existing agent pattern
-        # but structure it to match MCP architecture
-        from agents.market_search_agent import run_market_research_agent
-        from agents.execution_agent import run_execute_agent
-        from agents.portfolio_manager_agent import run_portfolio_manager_agent
-        from agents.investment_strategy_agent import run_investment_strategy_agent
-        from agents.general_agent import run_general_agent
 
-        in_process_handlers = {
-            "market": run_market_research_agent,
-            "execution": run_execute_agent,
-            "portfolio": run_portfolio_manager_agent,
-            "strategy": run_investment_strategy_agent,
-            "general": run_general_agent,
-        }
-        
-        # Determine which MCP servers would be used based on query
-        route_info = self._resolve_route(query)
-        servers_used = route_info["servers"]
-
-        # Optional Stage-2 bridge: invoke MCP servers over stdio transport.
-        # Keep execution on existing path to preserve confirmation safeguards.
-        mcp_responses: Dict[str, str] = {}
-        if self.mcp_transport_enabled:
-            for server in servers_used:
-                if server in {"market", "portfolio", "strategy"}:
-                    try:
-                        mcp_text = await self._run_server_via_mcp(server, query, user_id)
-                        if mcp_text:
-                            mcp_responses[server] = mcp_text
-                    except Exception as exc:
-                        logger.warning("MCP transport failed for %s: %s", server, exc)
-
-            if mcp_responses:
-                if len(mcp_responses) == 1:
-                    response = list(mcp_responses.values())[0]
-                else:
-                    response = self._synthesize_responses(query, mcp_responses)
-
-                response = sanitize_user_response(str(response), user_message=query)
-                error_message = self._extract_response_error(response)
-                success = error_message is None
-                route_info = {
-                    **route_info,
-                    "transport": "mcp_stdio",
-                    "mcp_tools_used": list(mcp_responses.keys()),
-                }
-                return {
-                    "response": response,
-                    "mcp_servers_used": servers_used,
-                    "routing": route_info,
-                    "success": success,
-                    "error": error_message,
-                }
-        
-        # Route to appropriate in-process agent(s)
-        if len(servers_used) == 1:
-            server = servers_used[0]
-            handler = in_process_handlers.get(server, run_general_agent)
-            response = handler(query, user_id, session_id)
-        else:
-            responses: Dict[str, str] = {}
-            for server in servers_used:
-                handler = in_process_handlers.get(server)
-                if handler:
-                    responses[server] = handler(query, user_id, session_id)
-
-            response = self._synthesize_responses(query, responses)
-
-        response = sanitize_user_response(str(response), user_message=query)
-
-        error_message = self._extract_response_error(response)
-        success = error_message is None
-        
-        return {
-            "response": response,
-            "mcp_servers_used": servers_used,
-            "routing": {**route_info, "transport": "in_process_agents"},
-            "success": success,
-            "error": error_message,
-        }
-
-    async def _run_server_via_mcp(self, server: str, query: str, user_id: int) -> str:
-        """Invoke a server through MCP stdio with best-effort tool selection."""
-        config = MCP_SERVERS.get(server)
-        if not config:
-            raise RuntimeError(f"Unknown MCP server key: {server}")
-
-        server_params = StdioServerParameters(
-            command=config["command"][0],
-            args=config["command"][1:],
-            env=os.environ.copy(),
-        )
-
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                return await self._invoke_server_tool(session, server, query, user_id)
-
-    async def _invoke_server_tool(self, session: ClientSession, server: str, query: str, user_id: int) -> str:
-        """Map high-level intent to MCP tool calls for each server."""
-        q = (query or "").lower()
-        ticker = self._extract_ticker_from_query(query)
-
-        if server == "market":
-            if any(k in q for k in ("news", "headline", "trend")):
-                return await self._call_mcp_tool_text(session, "get_live_news", {"query": query, "num_results": 5})
-            if ticker and any(k in q for k in ("predict", "prediction", "forecast")):
-                return await self._call_mcp_tool_text(session, "predict_next_day", {"symbol": ticker})
-            if ticker:
-                return await self._call_mcp_tool_text(session, "get_market_analysis", {"symbol": ticker})
-            return await self._call_mcp_tool_text(session, "get_live_news", {"query": query, "num_results": 5})
-
-        if server == "portfolio":
-            if any(k in q for k in ("allocation", "weight", "breakdown")):
-                return await self._call_mcp_tool_text(session, "get_portfolio_allocation", {})
-            if any(k in q for k in ("risk", "concentration", "exposure")):
-                return await self._call_mcp_tool_text(session, "analyze_portfolio_risk", {})
-            if ticker and any(k in q for k in ("position", "holding", "own")):
-                return await self._call_mcp_tool_text(session, "check_position", {"symbol": ticker})
-            return await self._call_mcp_tool_text(session, "get_portfolio_snapshot", {})
-
-        if server == "strategy":
-            if any(k in q for k in ("rebalance", "rebalancing")):
-                return await self._call_mcp_tool_text(session, "portfolio_rebalancing_proposal", {"user_id": user_id})
-            if any(k in q for k in ("adherence", "following strategy", "on track")):
-                return await self._call_mcp_tool_text(session, "check_strategy_adherence", {"user_id": user_id})
-            if ticker and any(k in q for k in ("recommend", "should i", "buy", "sell", "invest")):
-                return await self._call_mcp_tool_text(
-                    session,
-                    "generate_investment_recommendation",
-                    {"symbol": ticker, "user_id": user_id},
-                )
-            return await self._call_mcp_tool_text(session, "get_risk_profile", {"user_id": user_id})
-
-        raise RuntimeError(f"No MCP tool mapping for server: {server}")
-
-    async def _call_mcp_tool_text(self, session: ClientSession, tool_name: str, kwargs: Dict[str, Any]) -> str:
-        """Call an MCP tool and normalize text payloads."""
-        result = await session.call_tool(tool_name, kwargs)
-        content = getattr(result, "content", None)
-        if content is None:
-            return "{}"
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: List[str] = []
-            for item in content:
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parts.append(text)
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts) if parts else "{}"
-        return str(content)
+    # -- Error handling (preserved from original) ---------------------------
 
     @staticmethod
     def _extract_response_error(response: str) -> Optional[str]:
@@ -547,354 +645,22 @@ class TrueMCPOrchestrator:
 
         if lower.startswith("error processing request"):
             return text
-
         if "quota exceeded" in lower:
             return "Upstream LLM quota exceeded"
-
         if "429" in lower and "quota" in lower:
             return "Upstream LLM quota exceeded"
-
         if "rate limit" in lower and "openrouter" in lower:
             return "Upstream LLM rate limit exceeded"
 
         return None
-    
-    def _determine_servers(self, query: str) -> List[str]:
-        """Compatibility helper that returns only resolved server keys."""
-        return self._resolve_route(query)["servers"]
 
-    def _resolve_route(self, query: str) -> Dict[str, Any]:
-        """Determine which MCP servers are needed using semantic routing first.
+    # -- Persistence --------------------------------------------------------
 
-        Strategy:
-        1) deterministic overrides for high-safety/high-precision intents
-        2) LLM intent routing with confidence gating
-        3) keyword-weight fallback when LLM route is unavailable/low confidence
-        """
-        q = (query or "").lower()
-
-        deterministic = self._determine_servers_override(q)
-        if deterministic:
-            return {
-                "servers": deterministic,
-                "source": "deterministic_override",
-                "confidence": 1.0,
-                "rationale": "matched deterministic high-priority route",
-                "requires_clarification": False,
-            }
-
-        if self.semantic_router_enabled:
-            decision = self._classify_intent_route(query)
-        else:
-            decision = None
-
-        if decision:
-            candidates: List[str] = []
-            candidates.extend(decision.primary_agents)
-
-            # Medium/high confidence can include supporting agents.
-            if decision.confidence >= self.semantic_router_secondary_min_confidence:
-                candidates.extend(decision.secondary_agents)
-
-            deduped = self._normalize_servers(candidates)
-            if deduped and decision.confidence >= self.semantic_router_min_confidence:
-                logger.info(
-                    "Semantic route selected: agents=%s confidence=%.2f reason=%s",
-                    deduped,
-                    decision.confidence,
-                    decision.rationale_short,
-                )
-                return {
-                    "servers": deduped[:2],
-                    "source": "semantic_router",
-                    "confidence": decision.confidence,
-                    "rationale": decision.rationale_short,
-                    "requires_clarification": decision.requires_clarification,
-                }
-
-            logger.info(
-                "Semantic route fallback triggered: confidence=%.2f fallback=%s",
-                decision.confidence,
-                decision.fallback_route,
-            )
-
-        fallback_servers = self._determine_servers_keyword_fallback(q)
-        return {
-            "servers": fallback_servers,
-            "source": "keyword_fallback",
-            "confidence": 0.0,
-            "rationale": "semantic route unavailable or below confidence threshold",
-            "requires_clarification": False,
-        }
-
-    def _determine_servers_override(self, q: str) -> Optional[List[str]]:
-        """Deterministic rules for requests where routing must be predictable."""
-        if (
-            any(k in q for k in ("most promising stocks", "promising stocks", "latest market trends"))
-            and any(k in q for k in ("invest", "investment", "trends", "trend"))
-        ):
-            return ["market", "strategy"]
-
-        if (
-            any(k in q for k in ("based on my portfolio", "custom guide", "future investments", "investment guide"))
-            and any(x in q for x in ("portfolio", "porfolio"))
-        ):
-            return ["portfolio", "strategy"]
-
-        if any(k in q for k in ("future investments", "investment guide", "custom guide")):
-            return ["strategy"]
-
-        if any(k in q for k in ("stock price", "price of", "current price", "quote")):
-            return ["market"]
-
-        if any(k in q for k in ("next-day prediction", "next day prediction", "prediction", "forecast", "predict")):
-            return ["market"]
-
-        if "buying power" in q and not any(x in q for x in ("buy ", "sell ", "place order", "execute")):
-            return ["portfolio"]
-
-        if (
-            ("holdings table" in q or "strict holdings" in q)
-            and any(x in q for x in ("quantity", "avg", "average buy", "current price", "market value"))
-        ):
-            return ["portfolio"]
-
-        if (
-            ("concentration" in q or "mismatch" in q)
-            and ("current holdings" in q or "factual" in q or "derived from current holdings" in q)
-        ):
-            return ["portfolio"]
-
-        has_portfolio_context = any(k in q for k in ("portfolio", "holding", "holdings", "position", "allocation"))
-        has_benchmark_compare = any(k in q for k in ("benchmark", "moderate investor", "mismatch", "compare"))
-        has_risk_context = any(k in q for k in ("risk", "profile", "concentration"))
-        if has_portfolio_context and has_benchmark_compare and has_risk_context:
-            return ["portfolio", "strategy"]
-
-        return None
-
-    def _classify_intent_route(self, query: str) -> Optional[IntentRouteDecision]:
-        """Semantic router that asks the LLM for structured multi-agent routing."""
-        prompt = f"""You are an intent router for a financial multi-agent system.
-
-Available agents:
-- market: predictions, quotes, market news/trends, company research
-- execution: buy/sell orders and trade execution flows
-- portfolio: current holdings, balances, transactions, factual account state
-- strategy: investment planning, allocation guidance, rebalancing, risk posture
-- general: fallback for non-financial or ambiguous requests
-
-Classify the user's intent and return JSON only with keys:
-primary_agents (array of up to 2 agents),
-secondary_agents (array of up to 2 agents),
-confidence (0 to 1),
-requires_clarification (boolean),
-fallback_route (one of market|execution|portfolio|strategy|general),
-rationale_short (max 20 words).
-
-Rules:
-1) Prefer precise routing over broad routing.
-2) Use execution only for explicit order intent (buy/sell/execute).
-3) For portfolio-derived recommendation requests, combine portfolio + strategy.
-4) For simple price/quote/prediction requests, route to market.
-5) If uncertain, set low confidence and fallback_route to general.
-
-User query: {query}
-"""
-        try:
-            result = self.llm.invoke(prompt)
-            text = str(result.content) if hasattr(result, "content") else str(result)
-            raw = self._extract_json_payload(text)
-            if not raw:
-                return None
-
-            data = json.loads(raw)
-            primary = self._normalize_servers(data.get("primary_agents", []))
-            secondary = self._normalize_servers(data.get("secondary_agents", []))
-            confidence = self._coerce_confidence(data.get("confidence"))
-            requires_clarification = bool(data.get("requires_clarification", False))
-            fallback_route = str(data.get("fallback_route", "general")).strip().lower()
-            if fallback_route not in ALLOWED_SERVER_KEYS:
-                fallback_route = "general"
-            rationale = str(data.get("rationale_short", "")).strip()
-
-            if not primary:
-                primary = [fallback_route]
-
-            return IntentRouteDecision(
-                primary_agents=primary,
-                secondary_agents=secondary,
-                confidence=confidence,
-                requires_clarification=requires_clarification,
-                fallback_route=fallback_route,
-                rationale_short=rationale,
-            )
-        except Exception as exc:
-            logger.warning("Semantic router unavailable, using fallback: %s", exc)
-            return None
-
-    @staticmethod
-    def _coerce_confidence(value: Any) -> float:
-        """Normalize LLM confidence payload to [0, 1]."""
-        try:
-            conf = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        if conf < 0:
-            return 0.0
-        if conf > 1:
-            return 1.0
-        return conf
-
-    @staticmethod
-    def _extract_json_payload(text: str) -> Optional[str]:
-        """Extract the first JSON object from model output."""
-        if not text:
-            return None
-        cleaned = text.strip()
-        if cleaned.startswith("{") and cleaned.endswith("}"):
-            return cleaned
-
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        return cleaned[start : end + 1]
-
-    @staticmethod
-    def _normalize_servers(servers: Any) -> List[str]:
-        """Return valid server keys in stable order with duplicates removed."""
-        if not isinstance(servers, list):
-            return []
-        normalized: List[str] = []
-        for server in servers:
-            key = str(server).strip().lower()
-            if key in ALLOWED_SERVER_KEYS and key not in normalized:
-                normalized.append(key)
-        return normalized
-
-    def _determine_servers_keyword_fallback(self, q: str) -> List[str]:
-        """Legacy weighted keyword fallback used when semantic routing is uncertain."""
-        _scores: Dict[str, float] = {"market": 0, "execution": 0, "portfolio": 0, "strategy": 0}
-
-        market_kw = {
-            "predict": 3, "prediction": 3, "forecast": 3, "lstm": 3,
-            "news": 2, "headline": 2, "research": 2, "analyze stock": 2,
-            "analyst": 2, "earnings": 2, "revenue": 1,
-            "price target": 2, "outlook": 2, "momentum": 1,
-            "stock price": 3, "price of": 2, "current price": 3, "quote": 2,
-            "bull": 1, "bear": 1, "rally": 1, "crash": 1,
-        }
-        for kw, weight in market_kw.items():
-            if kw in q:
-                _scores["market"] += weight
-
-        exec_kw = {
-            "buy": 3, "sell": 3, "trade": 3, "execute": 3, "order": 3,
-            "purchase": 2, "acquire": 2, "dump": 2, "liquidate": 2,
-            "place order": 3, "market order": 3, "limit order": 3,
-        }
-        for kw, weight in exec_kw.items():
-            if kw in ("buy", "sell", "trade", "order"):
-                if re.search(rf"\b{re.escape(kw)}\b", q):
-                    _scores["execution"] += weight
-            elif kw in q:
-                _scores["execution"] += weight
-
-        portfolio_kw = {
-            "portfolio": 3, "holdings": 3, "allocation": 2,
-            "position": 2, "dashboard": 2, "watchlist": 2,
-            "p&l": 2, "profit": 1, "loss": 1, "gain": 1,
-            "diversif": 2, "concentration": 2, "weight": 1,
-            "sector breakdown": 3, "performance": 2,
-            "balance": 3, "cash": 3, "transactions": 3,
-            "transaction": 3, "portfolio summary": 3,
-            "holdings summary": 3, "account summary": 2,
-        }
-        for kw, weight in portfolio_kw.items():
-            if kw in q:
-                _scores["portfolio"] += weight
-
-        strategy_kw = {
-            "strategy": 3, "strateg": 2, "recommend": 2,
-            "should i invest": 3, "should i buy": 2, "good investment": 2,
-            "rebalance": 3, "rebalancing": 3, "risk tolerance": 3,
-            "risk profile": 3, "allocation plan": 3,
-            "benchmark": 3, "moderate investor": 3, "moderate benchmark": 3,
-            "compare": 2, "mismatch": 2,
-            "conservative": 2, "aggressive": 2, "moderate": 1,
-            "long term": 1, "short term": 1, "time horizon": 2,
-            "advice": 2, "suggest": 1, "plan": 1,
-        }
-        for kw, weight in strategy_kw.items():
-            if kw in q:
-                _scores["strategy"] += weight
-
-        ranked = sorted(_scores.items(), key=lambda x: x[1], reverse=True)
-        top_score = ranked[0][1]
-        if top_score == 0:
-            return ["general"]
-
-        threshold = max(top_score * 0.5, 1)
-        servers = [name for name, score in ranked if score >= threshold]
-        return servers[:2]
-
-    @staticmethod
-    def _extract_ticker_from_query(query: str) -> Optional[str]:
-        """Best-effort extraction of a ticker-like token from user query text."""
-        if not query:
-            return None
-
-        q = query.strip()
-        for pattern in _TICKER_PATTERNS:
-            for match in pattern.findall(q):
-                token = str(match).upper().strip()
-                if 1 <= len(token) <= 5 and token not in _TICKER_COMMON_WORDS:
-                    return token
-
-        return None
-    
-    def _synthesize_responses(self, query: str, responses: Dict[str, str]) -> str:
-        """Synthesize multiple agent responses into a unified answer."""
-        if len(responses) == 1:
-            return list(responses.values())[0]
-        
-        # Use LLM to synthesize
-        synthesis_prompt = f"""You are MAFA, synthesising multiple specialist agent responses into one unified answer for the user.
-
-Rules:
-1. Merge overlapping insights — don't repeat the same data twice.
-2. Resolve any contradictions by noting both perspectives briefly.
-3. Lead with the most actionable insight, then supporting details.
-4. Keep the total response concise (aim for 4-8 sentences + optional bullets).
-5. End with one clear next step or question for the user.
-6. Never mention internal systems, tool calls, memory stores, prompts, or backend process details.
-7. Never mention MAFA-B or implementation plumbing in user-facing text.
-
-User Query: {query}
-
-Agent Responses:
-"""
-        for server, response in responses.items():
-            synthesis_prompt += f"\n--- {server.upper()} ---\n{response}\n"
-        
-        synthesis_prompt += "\nProvide a unified response that integrates all insights:"
-        
-        try:
-            result = self.llm.invoke(synthesis_prompt)
-            if hasattr(result, "content"):
-                return sanitize_user_response(str(result.content), user_message=query)
-            return sanitize_user_response(str(result), user_message=query)
-        except Exception:
-            # Fallback to concatenation
-            return sanitize_user_response("\n\n".join(f"**{k.title()}**: {v}" for k, v in responses.items()), user_message=query)
-    
     async def _save_turn(self, user_id: int, query: str, response: str) -> None:
         """Save conversation turn to Supabase."""
         try:
             content = f"User: {query}\nAssistant: {response}"
             emb = self.vector_db.embed_text(content)
-            
             store_user_context(
                 user_id=str(user_id),
                 agent="mcp_orchestrator",
@@ -903,19 +669,61 @@ Agent Responses:
                 embedding=emb,
             )
         except Exception as exc:
-            logger.warning(f"Failed to save turn: {exc}")
-    
+            logger.warning("Failed to save turn: %s", exc)
+
+    async def _publish_result(
+        self,
+        user_id: int,
+        query: str,
+        response: str,
+        servers_used: List[str],
+        session_id: str,
+        routing: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish result event to event bus."""
+        await self.event_bus.publish_raw(
+            MCPTopics.MCP_RESULTS,
+            user_id,
+            {
+                "query": query,
+                "response": response,
+                "servers_used": servers_used,
+                "routing": routing or {},
+                "session_id": session_id,
+            },
+        )
+
+    # -- Helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _build_response(
+        response: str,
+        servers_used: List[str],
+        routing: Dict[str, Any],
+        success: bool,
+        start_time: float,
+        user_id: int,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Build the standard orchestration response dict."""
+        return {
+            "response": response,
+            "mcp_servers_used": servers_used,
+            "routing": routing,
+            "success": success,
+            "error": None,
+            "execution_time": time.time() - start_time,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
     def process_query(
         self,
         user_id: int,
         query: str,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Synchronous wrapper for orchestrate().
-
-        Uses asyncio.run() which is safe in all Python 3.10+ contexts,
-        replacing the deprecated get_event_loop().run_until_complete() pattern.
-        """
+        """Synchronous wrapper for orchestrate()."""
         return asyncio.run(
             self.orchestrate(user_id, query, session_id)
         )

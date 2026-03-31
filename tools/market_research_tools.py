@@ -67,11 +67,11 @@ def _fetch_ohlcv_from_yfinance(ticker: str, period: str = "3mo") -> Optional[Lis
         
         # Convert to list of dicts
         records = df[["date", "open", "high", "low", "close", "volume"]].to_dict("records")
-        logger.info(f"Using Yahoo Finance OHLCV for {ticker}: {len(records)} records")
+        logger.debug(f"Using Yahoo Finance OHLCV for {ticker}: {len(records)} records")
         return records
         
     except Exception as e:
-        logger.warning(f"Yahoo Finance OHLCV fallback failed for {ticker}: {e}")
+        logger.debug(f"Yahoo Finance OHLCV fallback failed for {ticker}: {e}")
         return None
 
 
@@ -83,7 +83,7 @@ def _fetch_ohlcv(ticker: str) -> List[dict]:
     try:
         return _fetch_ohlcv_from_broker(ticker)
     except Exception as e:
-        logger.warning(f"Broker API unavailable for {ticker} OHLCV: {e}")
+        logger.debug(f"Broker API unavailable for {ticker} OHLCV: {e}")
     
     # Try fallback: Yahoo Finance
     if USE_FALLBACK:
@@ -147,7 +147,7 @@ def predict(ticker: str) -> str:
         predicted_price = float(prediction_df)
         return json.dumps({"ticker": ticker, "predicted_close": round(predicted_price, 2)})
     except (RequestException, ValueError, TypeError, RuntimeError, ImportError) as exc:
-        logger.warning("Prediction failed for %s: %s", ticker, exc)
+        logger.debug("Prediction failed for %s: %s", ticker, exc)
         return json.dumps({"ticker": ticker, "error": f"Prediction failed: {exc}"})
 
 
