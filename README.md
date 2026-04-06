@@ -1,6 +1,6 @@
 # MAFA-Agents
 
-Multi-Agent Financial Assistant powered by Model Context Protocol (MCP) and OpenRouter.
+Multi-Agent Financial Assistant powered by Model Context Protocol(MCP) and OpenRouter.
 
 ## Overview
 
